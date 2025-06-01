@@ -1,14 +1,20 @@
-using UnityEngine;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Threading.Tasks;
-using System.Threading;
 using System.Linq;
-using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
+using UnityEngine;
+using Random = UnityEngine.Random;
 
 namespace RTCK.NeuraBake.Runtime
 {
-    public class BakingCore
+    public class BakingCore : ILightmapRenderer
     {
         // RenderTexture ‚©‚ç Texture2D ‚Ö•ÏŠ·‚·‚éƒƒ\ƒbƒh
         public static Texture2D ConvertRenderTextureToTexture2D(RenderTexture rt)
@@ -58,7 +64,7 @@ namespace RTCK.NeuraBake.Runtime
                 }
 
                 File.WriteAllBytes(path, pngData);
-                Debug.Log($"Texture saved to: {path}");
+                // Debug.Log($"Texture saved to: {path}"); // ƒEƒBƒ“ƒhƒE‘¤‚Å•Û‘¶ƒƒbƒZ[ƒW‚ğo‚·‚Ì‚Åd•¡‰ñ”ğ‚àl—¶
                 return true;
             }
             catch (Exception e)
@@ -70,14 +76,66 @@ namespace RTCK.NeuraBake.Runtime
 
         private readonly NeuraBakeSettings settings;
         private readonly Light[] sceneLights;
-        private readonly NeuraBakeEmissiveSurface[] emissiveSurfaces; // ”­Œõ–Ê‚ğƒLƒƒƒbƒVƒ…
+        private readonly NeuraBakeEmissiveSurface[] emissiveSurfaces;
         private readonly Dictionary<Material, MaterialProperties> materialCache = new Dictionary<Material, MaterialProperties>();
         private readonly Dictionary<Mesh, MeshDataCache> meshDataCache = new Dictionary<Mesh, MeshDataCache>();
         private readonly object cacheLock = new object();
 
+        private class SpatialCache
+        {
+            private readonly struct RaycastKey : IEquatable<RaycastKey>
+            {
+                public readonly Vector3 Origin;
+                public readonly Vector3 Direction;
+                public readonly float MaxDistance;
+                private const float OriginPrecisionFactor = 100f;
+                private const float DirectionPrecisionFactor = 1000f;
+                private const float DistancePrecisionFactor = 100f;
+
+                public RaycastKey(Vector3 origin, Vector3 direction, float maxDistance)
+                {
+                    Origin = new Vector3(
+                        Mathf.Round(origin.x * OriginPrecisionFactor) / OriginPrecisionFactor,
+                        Mathf.Round(origin.y * OriginPrecisionFactor) / OriginPrecisionFactor,
+                        Mathf.Round(origin.z * OriginPrecisionFactor) / OriginPrecisionFactor
+                    );
+                    Direction = direction.normalized;
+                    MaxDistance = Mathf.Round(maxDistance * DistancePrecisionFactor) / DistancePrecisionFactor;
+                }
+
+                public bool Equals(RaycastKey other)
+                {
+                    return Origin.Equals(other.Origin) &&
+                           Direction.Equals(other.Direction) &&
+                           MaxDistance == other.MaxDistance;
+                }
+                public override bool Equals(object obj) => obj is RaycastKey other && Equals(other);
+                public override int GetHashCode()
+                {
+                    unchecked
+                    {
+                        int hash = 17;
+                        hash = hash * 23 + Origin.GetHashCode();
+                        hash = hash * 23 + Direction.GetHashCode();
+                        hash = hash * 23 + MaxDistance.GetHashCode();
+                        return hash;
+                    }
+                }
+            }
+            private readonly ConcurrentDictionary<RaycastKey, bool> cache = new ConcurrentDictionary<RaycastKey, bool>();
+            public bool Raycast(Ray ray, float maxDistance)
+            {
+                var key = new RaycastKey(ray.origin, ray.direction, maxDistance);
+                return cache.GetOrAdd(key, k => Physics.Raycast(k.Origin, k.Direction, k.MaxDistance));
+            }
+            public void Clear() { cache.Clear(); }
+        }
+
+        private readonly SpatialCache mainRaycastCache = new SpatialCache();
+
         private class MaterialProperties
         {
-            public Material material; // Œ³‚Ìƒ}ƒeƒŠƒAƒ‹QÆ‚ğ•Û
+            public Material material;
             public Color BaseColor { get; }
             public float Metallic { get; }
             public float Roughness { get; }
@@ -85,54 +143,79 @@ namespace RTCK.NeuraBake.Runtime
             public Texture2D MetallicGlossMap { get; }
             public Texture2D NormalMap { get; }
             public Vector4 MainTexST { get; }
-            public float Smoothness { get; }
+            public float Smoothness { get; } // Roughness‚©‚çŒvZ‚³‚ê‚é‚½‚ßA’¼Ú‚Í•s—v‚©‚à
             public Vector2 uvScale = Vector2.one;
             public Vector2 uvOffset = Vector2.zero;
 
-            public MaterialProperties(Material material)
+            public MaterialProperties(Material mat)
             {
-                this.material = material;
-                BaseColor = material.HasProperty("_BaseColor") ? material.GetColor("_BaseColor") :
-                            (material.HasProperty("_Color") ? material.GetColor("_Color") : Color.white);
-                Metallic = material.HasProperty("_Metallic") ? material.GetFloat("_Metallic") : 0f;
-                Smoothness = material.HasProperty("_Glossiness") ? material.GetFloat("_Glossiness") :
-                             (material.HasProperty("_Smoothness") ? material.GetFloat("_Smoothness") : 0.5f);
+                material = mat; // MaterialQÆ‚ğ•Û
+                BaseColor = mat.HasProperty("_BaseColor") ? mat.GetColor("_BaseColor") :
+                            (mat.HasProperty("_Color") ? mat.GetColor("_Color") : Color.white);
+                Metallic = mat.HasProperty("_Metallic") ? mat.GetFloat("_Metallic") : 0f;
+                Smoothness = mat.HasProperty("_Glossiness") ? mat.GetFloat("_Glossiness") :
+                             (mat.HasProperty("_Smoothness") ? mat.GetFloat("_Smoothness") : 0.5f);
                 Roughness = 1f - Smoothness;
-                BaseColorMap = material.HasProperty("_MainTex") ? material.GetTexture("_MainTex") as Texture2D : null;
-                MetallicGlossMap = material.HasProperty("_MetallicGlossMap") ? material.GetTexture("_MetallicGlossMap") as Texture2D : null;
-                NormalMap = material.HasProperty("_BumpMap") ? material.GetTexture("_BumpMap") as Texture2D : null;
-                MainTexST = material.HasProperty("_MainTex_ST") ? material.GetVector("_MainTex_ST") : new Vector4(1, 1, 0, 0);
+                BaseColorMap = mat.HasProperty("_MainTex") ? mat.GetTexture("_MainTex") as Texture2D : null;
+                MetallicGlossMap = mat.HasProperty("_MetallicGlossMap") ? mat.GetTexture("_MetallicGlossMap") as Texture2D : null;
+                NormalMap = mat.HasProperty("_BumpMap") ? mat.GetTexture("_BumpMap") as Texture2D : null;
+                MainTexST = mat.HasProperty("_MainTex_ST") ? mat.GetVector("_MainTex_ST") : new Vector4(1, 1, 0, 0);
                 uvScale = new Vector2(MainTexST.x, MainTexST.y);
                 uvOffset = new Vector2(MainTexST.z, MainTexST.w);
             }
 
             public Color GetSampledBaseColor(Vector2 uv)
             {
-                Vector2 tiledUv = new Vector2(uv.x * MainTexST.x + MainTexST.z, uv.y * MainTexST.y + MainTexST.w);
-                Color texColor = BaseColorMap != null && BaseColorMap.isReadable ? BaseColorMap.GetPixelBilinear(tiledUv.x, tiledUv.y) : Color.white;
+                Vector2 tiledUv = new Vector2(uv.x * uvScale.x + uvOffset.x, uv.y * uvScale.y + uvOffset.y);
+                Color texColor = Color.white;
+                if (BaseColorMap != null)
+                {
+                    if (BaseColorMap.isReadable) texColor = BaseColorMap.GetPixelBilinear(Mathf.Repeat(tiledUv.x, 1f), Mathf.Repeat(tiledUv.y, 1f));
+                    else Debug.LogWarning($"NeuraBake: Texture '{BaseColorMap.name}' on material '{material.name}' is not readable.");
+                }
                 return BaseColor * texColor;
             }
 
             public (float sampledMetallic, float sampledRoughness) GetSampledMetallicRoughness(Vector2 uv)
             {
-                Vector2 tiledUv = new Vector2(uv.x * MainTexST.x + MainTexST.z, uv.y * MainTexST.y + MainTexST.w);
+                Vector2 tiledUv = new Vector2(uv.x * uvScale.x + uvOffset.x, uv.y * uvScale.y + uvOffset.y);
                 float finalMetallic = Metallic;
                 float currentSmoothness = Smoothness;
 
-                if (MetallicGlossMap != null && MetallicGlossMap.isReadable)
+                if (MetallicGlossMap != null)
                 {
-                    Color metallicGlossSample = MetallicGlossMap.GetPixelBilinear(tiledUv.x, tiledUv.y);
-                    bool isMaskMap = IsMaskMap(material, MetallicGlossMap);
-                    if (isMaskMap)
+                    if (MetallicGlossMap.isReadable)
                     {
-                        finalMetallic = metallicGlossSample.a; // HDRP MaskMap: Metallic in A
-                        currentSmoothness = metallicGlossSample.r; // HDRP MaskMap: Roughness in R
+                        Color metallicGlossSample = MetallicGlossMap.GetPixelBilinear(Mathf.Repeat(tiledUv.x, 1f), Mathf.Repeat(tiledUv.y, 1f));
+                        if (IsMaskMap(material, MetallicGlossMap)) // IsMaskMap‚ÍBakingCore‚Ìstaticƒƒ\ƒbƒh
+                        {
+                            // MaskMap ‚Ìƒ`ƒƒƒ“ƒlƒ‹Š„‚è“–‚Ä‚ÍƒVƒF[ƒ_[/ƒpƒCƒvƒ‰ƒCƒ“‚ÉˆË‘¶‚·‚é‚½‚ßA‚±‚±‚Å‚Íˆê—á
+                            // URP Lit: Metallic (G), Smoothness (A)
+                            // HDRP Lit: Metallic (R), Smoothness (A)
+                            // ‚æ‚èŒ˜˜S‚É‚·‚é‚É‚ÍƒVƒF[ƒ_[–¼‚ğƒ`ƒFƒbƒN‚·‚é‚©Aİ’è‚Å‘I‘ğ‚Å‚«‚é‚æ‚¤‚É‚·‚é
+                            if (material.shader.name.Contains("HDRP"))
+                            {
+                                finalMetallic = metallicGlossSample.r;
+                                currentSmoothness = metallicGlossSample.a;
+                            }
+                            else if (material.shader.name.Contains("URP"))
+                            { // URP/Lit ‚ğ‰¼’è
+                                finalMetallic = metallicGlossSample.g;
+                                currentSmoothness = metallicGlossSample.a;
+                            }
+                            else
+                            { // Standard Shader (Metallic setup)
+                                finalMetallic *= metallicGlossSample.r;
+                                currentSmoothness *= metallicGlossSample.a;
+                            }
+                        }
+                        else // Standard Shader (Metallic setup)
+                        {
+                            finalMetallic *= metallicGlossSample.r;
+                            currentSmoothness *= metallicGlossSample.a;
+                        }
                     }
-                    else
-                    {
-                        finalMetallic *= metallicGlossSample.r; // Standard shader: Metallic is in R channel
-                        currentSmoothness *= metallicGlossSample.a; // Standard shader: Smoothness is in A channel
-                    }
+                    else Debug.LogWarning($"NeuraBake: Texture '{MetallicGlossMap.name}' on material '{material.name}' is not readable.");
                 }
                 return (Mathf.Clamp01(finalMetallic), 1f - Mathf.Clamp01(currentSmoothness));
             }
@@ -146,9 +229,8 @@ namespace RTCK.NeuraBake.Runtime
             public readonly int[] Triangles;
             public MeshDataCache(Mesh mesh)
             {
-                Vertices = mesh.vertices;
-                Normals = mesh.normals;
-                UVs = mesh.uv2 != null && mesh.uv2.Length == mesh.vertexCount ? mesh.uv2 : mesh.uv;
+                Vertices = mesh.vertices; Normals = mesh.normals;
+                UVs = (mesh.uv2 != null && mesh.uv2.Length == mesh.vertexCount) ? mesh.uv2 : mesh.uv;
                 Triangles = mesh.triangles;
             }
         }
@@ -156,218 +238,232 @@ namespace RTCK.NeuraBake.Runtime
         public BakingCore(NeuraBakeSettings bakeSettings)
         {
             settings = bakeSettings ?? throw new ArgumentNullException(nameof(bakeSettings));
-            sceneLights = GameObject.FindObjectsOfType<Light>().Where(l => l.isActiveAndEnabled && l.intensity > 0).ToArray();
+            sceneLights = GameObject.FindObjectsOfType<Light>().Where(l => l.isActiveAndEnabled && l.intensity > 0 && l.gameObject.activeInHierarchy).ToArray();
             emissiveSurfaces = GameObject.FindObjectsOfType<NeuraBakeEmissiveSurface>()
-                                         .Where(es => es.enabled && es.bakeEmissive && es.intensity > 0)
+                                         .Where(es => es.enabled && es.bakeEmissive && es.intensity > 0 && es.gameObject.activeInHierarchy)
                                          .ToArray();
         }
 
         private MaterialProperties GetMaterialProperties(Material material)
         {
-            lock (cacheLock)
-            {
-                if (!materialCache.TryGetValue(material, out MaterialProperties props))
-                {
-                    props = new MaterialProperties(material);
-                    materialCache[material] = props;
-                }
-                return props;
-            }
+            lock (cacheLock) { if (!materialCache.TryGetValue(material, out MaterialProperties props)) { props = new MaterialProperties(material); materialCache[material] = props; } return props; }
         }
-
         private MeshDataCache GetMeshData(Mesh mesh)
         {
-            lock (cacheLock)
-            {
-                if (!meshDataCache.TryGetValue(mesh, out MeshDataCache data))
-                {
-                    data = new MeshDataCache(mesh);
-                    meshDataCache[mesh] = data;
-                }
-                return data;
-            }
+            lock (cacheLock) { if (!meshDataCache.TryGetValue(mesh, out MeshDataCache data)) { data = new MeshDataCache(mesh); meshDataCache[mesh] = data; } return data; }
+        }
+
+        // ILightmapRendererƒCƒ“ƒ^[ƒtƒF[ƒX‚ÌÀ‘•
+        public async Task<Texture2D> RenderAsync(CancellationToken token, IProgress<(float percentage, string message)> progress)
+        {
+            return await BakeLightmapAsync(token, progress);
         }
 
         public async Task<Texture2D> BakeLightmapAsync(CancellationToken token, IProgress<(float percentage, string message)> progressReporter)
         {
             MeshRenderer[] renderers = GameObject.FindObjectsOfType<MeshRenderer>()
-                                               .Where(r => r.enabled && r.gameObject.isStatic).ToArray();
+                                               .Where(r => r.enabled && r.gameObject.isStatic && r.gameObject.activeInHierarchy).ToArray();
+            if (renderers.Length == 0) { progressReporter?.Report((1f, "ƒxƒCƒN‘ÎÛ‚ÌÃ“IMeshRenderer‚È‚µ")); return null; }
 
-            if (renderers.Length == 0)
-            {
-                progressReporter?.Report((1f, "ƒxƒCƒN‘ÎÛ‚ÌÃ“IMeshRenderer‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñB"));
-                return null;
-            }
-
-            MeshRenderer targetRenderer = renderers[0];
+            MeshRenderer targetRenderer = renderers[0]; // TODO: ‘SƒŒƒ“ƒ_ƒ‰[‘Î‰
             Material targetMaterial = targetRenderer.sharedMaterial;
             MeshFilter meshFilter = targetRenderer.GetComponent<MeshFilter>();
-
-            if (meshFilter == null || meshFilter.sharedMesh == null || targetMaterial == null)
-            {
-                progressReporter?.Report((1f, "‘ÎÛƒIƒuƒWƒFƒNƒg‚ÉƒƒbƒVƒ…‚Ü‚½‚Íƒ}ƒeƒŠƒAƒ‹‚ª‚ ‚è‚Ü‚¹‚ñB"));
-                return null;
-            }
+            if (meshFilter?.sharedMesh == null || targetMaterial == null) { progressReporter?.Report((1f, "‘ÎÛƒƒbƒVƒ…/ƒ}ƒeƒŠƒAƒ‹‚È‚µ")); return null; }
 
             Mesh mesh = meshFilter.sharedMesh;
             MeshDataCache meshData = GetMeshData(mesh);
-
-            if (meshData.UVs == null || meshData.UVs.Length == 0)
-            {
-                progressReporter?.Report((1f, "‘ÎÛƒƒbƒVƒ…‚Éƒ‰ƒCƒgƒ}ƒbƒv—p‚ÌUV‚ª‚ ‚è‚Ü‚¹‚ñB"));
-                return null;
-            }
+            if (meshData.UVs == null || meshData.UVs.Length == 0) { progressReporter?.Report((1f, "‘ÎÛƒƒbƒVƒ…‚ÉUV‚È‚µ")); return null; }
 
             int textureWidth = settings.atlasSize;
             int textureHeight = settings.atlasSize;
-            Texture2D lightmapTexture = new Texture2D(textureWidth, textureHeight, TextureFormat.RGBAHalf, false, true);
-            lightmapTexture.name = $"{targetRenderer.gameObject.name}_Lightmap_Baked";
-            lightmapTexture.wrapMode = TextureWrapMode.Clamp;
-            lightmapTexture.filterMode = FilterMode.Bilinear;
+            progressReporter?.Report((0.01f, "ƒ‰ƒCƒgƒ}ƒbƒv¶¬ŠJn..."));
 
-            Color[] pixels = new Color[textureWidth * textureHeight];
-            int totalPixelsToProcess = textureWidth * textureHeight;
-            int processedPixels = 0;
-            float accumulatedBentNormalY = 0f;
+            // ˆ—ƒpƒX‚Ì‘I‘ğ (RTCK.NeuraBakeWindow.cs‘¤‚ÅBakingCore‚ğ’¼ÚŒÄ‚Ôê‡‚Í‚±‚Ì•ªŠò‚Í•s—v)
+            // Œ»İ‚ÍBakingCore‚ªƒfƒtƒHƒ‹ƒgCPUƒŒƒ“ƒ_ƒ‰[‚Æ‚µ‚Ä‹@”\‚·‚é‚½‚ßA‚±‚Ì•ªŠò‚ÍŠT”O“I‚È‚à‚Ì
+            bool attemptGPU = false; // settings.rendererType == LightmapRendererType.GPU_Renderer; (Window‘¤‚Å•ªŠòÏ‚İ)
+            bool attemptJobs = !attemptGPU && SystemInfo.processorCount > 1; // (Window‘¤‚Å•ªŠòÏ‚İ)
 
-            for (int y = 0; y < textureHeight; y++)
+            Texture2D lightmapTexture = null;
+            // ‘S‚Ä‚ÌƒsƒNƒZƒ‹ƒf[ƒ^‚ğŠi”[‚·‚é”z—ñ (ŠeƒpƒX‚Å‚±‚ê‚É‘‚«‚Ş‚©AƒpƒXŒÅ—L‚Ì”z—ñ‚ğg‚¤)
+            Color[] finalPixels = new Color[textureWidth * textureHeight];
+
+
+            try
             {
-                for (int x = 0; x < textureWidth; x++)
+                if (attemptGPU) // GPUƒpƒX (ƒXƒ^ƒu)
                 {
-                    token.ThrowIfCancellationRequested();
-                    Vector2 texelCenterUv = new Vector2((x + 0.5f) / textureWidth, (y + 0.5f) / textureHeight);
+                    progressReporter?.Report((0.05f, "GPUˆ—s’†..."));
+                    lightmapTexture = ProcessWithComputeShader(targetRenderer, mesh, targetMaterial, textureWidth, textureHeight, token, progressReporter);
+                    if (lightmapTexture == null) { progressReporter?.Report((0.1f, "GPUˆ—¸”sBƒtƒH[ƒ‹ƒoƒbƒN...")); attemptGPU = false; }
+                    else { progressReporter?.Report((1f, "GPUˆ—Š®—¹")); }
+                }
 
-                    if (FindTriangleAndBarycentricCoords(meshData, texelCenterUv, out int triangleIndex, out Vector3 barycentricCoords))
+                if (!attemptGPU && attemptJobs) // Job System ƒpƒX (ƒXƒ^ƒu)
+                {
+                    progressReporter?.Report((0.15f, "Job Systemˆ—’†..."));
+                    Vector3[] worldPositions = new Vector3[textureWidth * textureHeight]; // Job‚É“n‚·‚½‚ß‚Ì–‘OŒvZƒf[ƒ^
+                    Vector3[] worldNormals = new Vector3[textureWidth * textureHeight];   // Job‚É“n‚·‚½‚ß‚Ì–‘OŒvZƒf[ƒ^
+
+                    // worldPositions ‚Æ worldNormals ‚ğŒvZ‚·‚éƒƒWƒbƒN (ˆÈ‘O‚ÌƒR[ƒh‚©‚çˆø—p)
+                    int validPixelCountForJob = 0;
+                    Matrix4x4 localToWorld = targetRenderer.transform.localToWorldMatrix; // ƒƒCƒ“ƒXƒŒƒbƒh‚Åæ“¾
+
+                    await Task.Run(() => Parallel.For(0, textureHeight, y_loop =>
                     {
-                        int vIdx0 = meshData.Triangles[triangleIndex * 3 + 0];
-                        int vIdx1 = meshData.Triangles[triangleIndex * 3 + 1];
-                        int vIdx2 = meshData.Triangles[triangleIndex * 3 + 2];
-
-                        Vector3 localPos = InterpolateVector3(meshData.Vertices[vIdx0], meshData.Vertices[vIdx1], meshData.Vertices[vIdx2], barycentricCoords);
-                        Vector3 localNormal = InterpolateVector3(meshData.Normals[vIdx0], meshData.Normals[vIdx1], meshData.Normals[vIdx2], barycentricCoords).normalized;
-
-                        Vector2 lightmapUV = InterpolateVector2(meshData.UVs[vIdx0], meshData.UVs[vIdx1], meshData.UVs[vIdx2], barycentricCoords);
-
-                        Vector3 worldPos = targetRenderer.transform.TransformPoint(localPos);
-                        Vector3 worldNormal = targetRenderer.transform.TransformDirection(localNormal).normalized;
-
-                        Color accumulatedColor = Color.black;
-                        accumulatedBentNormalY = 0f;
-                        int validAoSamplesForBentNormal = 0;
-
-                        for (int s = 0; s < settings.sampleCount; s++)
+                        if (token.IsCancellationRequested) return;
+                        for (int x_loop = 0; x_loop < textureWidth; x_loop++)
                         {
-                            Vector2 currentSampleUV = texelCenterUv;
-                            if (settings.sampleCount > 1)
+                            int idx = y_loop * textureWidth + x_loop;
+                            Vector2 uv = new Vector2((x_loop + 0.5f) / textureWidth, (y_loop + 0.5f) / textureHeight);
+                            if (FindTriangleAndBarycentricCoords(meshData, uv, out int triIdx, out Vector3 bary))
                             {
-                                float offsetX = (UnityEngine.Random.value - 0.5f) / textureWidth;
-                                float offsetY = (UnityEngine.Random.value - 0.5f) / textureHeight;
-                                currentSampleUV = new Vector2(texelCenterUv.x + offsetX, texelCenterUv.y + offsetY);
-                            }
-
-                            var colorInfo = CalculatePixelColor(worldPos, worldNormal, targetMaterial, lightmapUV, currentSampleUV);
-                            accumulatedColor += colorInfo.color;
-                            if (settings.directional && colorInfo.unoccludedRays > 0)
-                            {
-                                accumulatedBentNormalY += colorInfo.bentNormalY * colorInfo.unoccludedRays;
-                                validAoSamplesForBentNormal += colorInfo.unoccludedRays;
-                            }
-                        }
-                        Color finalPixelColor = accumulatedColor / settings.sampleCount;
-
-                        if (settings.directional)
-                        {
-                            if (validAoSamplesForBentNormal > 0)
-                            {
-                                finalPixelColor.a = Mathf.Clamp01(0.5f + (accumulatedBentNormalY / validAoSamplesForBentNormal) * 0.5f);
-                            }
-                            else if (settings.useAmbientOcclusion && settings.aoSampleCount > 0)
-                            {
-                                finalPixelColor.a = 0f;
+                                int v0 = meshData.Triangles[triIdx * 3]; int v1 = meshData.Triangles[triIdx * 3 + 1]; int v2 = meshData.Triangles[triIdx * 3 + 2];
+                                Vector3 lp = InterpolateVector3(meshData.Vertices[v0], meshData.Vertices[v1], meshData.Vertices[v2], bary);
+                                Vector3 ln = InterpolateVector3(meshData.Normals[v0], meshData.Normals[v1], meshData.Normals[v2], bary).normalized;
+                                worldPositions[idx] = localToWorld.MultiplyPoint3x4(lp);
+                                worldNormals[idx] = localToWorld.MultiplyVector(ln).normalized;
+                                Interlocked.Increment(ref validPixelCountForJob);
                             }
                             else
                             {
-                                finalPixelColor.a = 0.5f;
+                                finalPixels[idx] = Color.clear; // Job‚Åˆ—‚µ‚È‚¢ƒsƒNƒZƒ‹‚ÍƒNƒŠƒA
                             }
                         }
-                        else
-                        {
-                            finalPixelColor.a = 1.0f;
-                        }
+                    }), token);
+                    if (token.IsCancellationRequested) throw new OperationCanceledException();
+                    progressReporter?.Report((0.3f, $"Job—pƒf[ƒ^€”õŠ®—¹ ({validPixelCountForJob}ƒsƒNƒZƒ‹)"));
 
-                        // ƒKƒ“ƒ}•â³‚ªCalculatePixelColor‚Ì’†‚Å“K—p‚³‚ê‚Ä‚¢‚é‚Ì‚ÅA‚±‚±‚Å‚Í’Ç‰Á‚Ìˆ—‚Í•s—v
-                        pixels[y * textureWidth + x] = finalPixelColor;
+                    // ProcessPixelsWithJobSystem‚Í outputPixelData (finalPixels) ‚ÉŒ‹‰Ê‚ğ‘‚«‚Ş‚æ‚¤‚É•ÏX
+                    Texture2D jobBuiltTexture = ProcessPixelsWithJobSystem(finalPixels, textureWidth, textureHeight, worldPositions, worldNormals, token);
+                    if (jobBuiltTexture != null)
+                    { // jobBuiltTexture‚ÍÀÛ‚É‚ÍfinalPixels‚©‚ç¶¬‚³‚ê‚½‚à‚Ì
+                        lightmapTexture = jobBuiltTexture; // ‚±‚ÌƒeƒNƒXƒ`ƒƒ‚ğÅIŒ‹‰Ê‚Æ‚·‚é
+                        progressReporter?.Report((1f, "Job Systemˆ—Š®—¹"));
                     }
                     else
                     {
-                        pixels[y * textureWidth + x] = Color.clear;
+                        progressReporter?.Report((0.4f, "Job Systemˆ—¸”sB’ÊíCPU‚Ö..."));
+                        attemptJobs = false;
                     }
-                    processedPixels++;
                 }
-                if (y % 10 == 0 || y == textureHeight - 1)
-                {
-                    float percentage = (float)processedPixels / totalPixelsToProcess;
-                    await Task.Yield();
-                    progressReporter?.Report((percentage, $"ƒsƒNƒZƒ‹ˆ—’† ({y + 1}/{textureHeight}s)"));
-                }
-            }
 
-            lightmapTexture.SetPixels(pixels);
-            lightmapTexture.Apply(true, false);
-            progressReporter?.Report((1f, "ƒ‰ƒCƒgƒ}ƒbƒv¶¬Š®—¹"));
-            return lightmapTexture;
+                if (!attemptGPU && !attemptJobs) // ’ÊíCPU•À—ñˆ—ƒpƒX
+                {
+                    progressReporter?.Report((0.5f, "CPU•À—ñˆ—’†..."));
+                    int processedPixelCount = 0;
+                    int totalValidPixelsToProcess = textureWidth * textureHeight; // —LŒøƒsƒNƒZƒ‹”‚Åi’»ŒvZ‚à‰Â
+                    int reportInterval = Math.Max(1, totalValidPixelsToProcess / 100);
+                    var parallelOptions = new ParallelOptions { CancellationToken = token, MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
+                    mainRaycastCache.Clear();
+
+                    await Task.Run(() =>
+                    {
+                        int chunkSize = 32; int numChunksX = Mathf.CeilToInt((float)textureWidth / chunkSize); int numChunksY = Mathf.CeilToInt((float)textureHeight / chunkSize);
+                        Parallel.For(0, numChunksX * numChunksY, parallelOptions, chunkIdx =>
+                        {
+                            int cX = chunkIdx % numChunksX; int cY = chunkIdx / numChunksX;
+                            int sX = cX * chunkSize; int sY = cY * chunkSize;
+                            int eX = Math.Min(sX + chunkSize, textureWidth); int eY = Math.Min(sY + chunkSize, textureHeight);
+                            for (int curY = sY; curY < eY; curY++)
+                            {
+                                for (int curX = sX; curX < eX; curX++)
+                                {
+                                    if (token.IsCancellationRequested) return;
+                                    int pxIdx = curY * textureWidth + curX;
+                                    Vector2 tcUv = new Vector2((curX + 0.5f) / textureWidth, (curY + 0.5f) / textureHeight);
+                                    if (FindTriangleAndBarycentricCoords(meshData, tcUv, out int triIdx, out Vector3 bary))
+                                    {
+                                        int v0 = meshData.Triangles[triIdx * 3]; int v1 = meshData.Triangles[triIdx * 3 + 1]; int v2 = meshData.Triangles[triIdx * 3 + 2];
+                                        Vector3 lp = InterpolateVector3(meshData.Vertices[v0], meshData.Vertices[v1], meshData.Vertices[v2], bary);
+                                        Vector3 ln = InterpolateVector3(meshData.Normals[v0], meshData.Normals[v1], meshData.Normals[v2], bary).normalized;
+                                        Vector2 lmUV = InterpolateVector2(meshData.UVs[v0], meshData.UVs[v1], meshData.UVs[v2], bary);
+                                        Vector3 wp = targetRenderer.transform.TransformPoint(lp);
+                                        Vector3 wn = targetRenderer.transform.TransformDirection(ln).normalized;
+                                        Color accCol = Color.black; float accBNY = 0f; int validBNSamples = 0;
+                                        for (int s = 0; s < settings.sampleCount; ++s)
+                                        {
+                                            Vector2 matUV = tcUv;
+                                            if (settings.sampleCount > 1) { matUV = new Vector2(tcUv.x + (Random.value - 0.5f) / textureWidth, tcUv.y + (Random.value - 0.5f) / textureHeight); }
+                                            var (pxCol, bnY, unocRay) = CalculatePixelColor(wp, wn, targetMaterial, lmUV, matUV);
+                                            accCol += pxCol;
+                                            if (settings.directional && unocRay > 0) { accBNY += bnY * unocRay; validBNSamples += unocRay; }
+                                        }
+                                        Color fpxCol = accCol / settings.sampleCount;
+                                        if (settings.directional) { if (validBNSamples > 0) fpxCol.a = Mathf.Clamp01(0.5f + (accBNY / validBNSamples) * 0.5f); else if (settings.useAmbientOcclusion && settings.aoSampleCount > 0) fpxCol.a = 0f; else fpxCol.a = 0.5f; }
+                                        else { fpxCol.a = 1f; }
+                                        finalPixels[pxIdx] = fpxCol;
+                                    }
+                                    else { finalPixels[pxIdx] = Color.clear; }
+                                    int curProc = Interlocked.Increment(ref processedPixelCount);
+                                    if (curProc % reportInterval == 0 || curProc == totalValidPixelsToProcess)
+                                    {
+                                        float prog = 0.5f + (0.5f * curProc / totalValidPixelsToProcess);
+                                        progressReporter?.Report((prog, $"CPU ƒsƒNƒZƒ‹ˆ—’†: {curProc}/{totalValidPixelsToProcess}"));
+                                    }
+                                }
+                            }
+                        });
+                    }, token);
+                    if (token.IsCancellationRequested) throw new OperationCanceledException();
+
+                    DilationEdgePadding(finalPixels, textureWidth, textureHeight, 8); // ƒGƒbƒWƒpƒfƒBƒ“ƒO
+
+                    lightmapTexture = new Texture2D(textureWidth, textureHeight, TextureFormat.RGBAHalf, false, true);
+                    lightmapTexture.name = $"{targetRenderer.gameObject.name}_Lightmap_Baked_CPU";
+                    lightmapTexture.wrapMode = TextureWrapMode.Clamp;
+                    lightmapTexture.filterMode = FilterMode.Bilinear;
+                    lightmapTexture.SetPixels(finalPixels);
+                    lightmapTexture.Apply(true, false); //ƒ~ƒbƒvƒ}ƒbƒv‚Í•s—v‚È‚Ì‚Åfalse, “Ç‚İæ‚è•s‰Â‚É‚Í‚µ‚È‚¢
+                    progressReporter?.Report((1f, "CPU•À—ñˆ—Š®—¹"));
+                }
+
+                if (lightmapTexture == null && !token.IsCancellationRequested)
+                {
+                    progressReporter?.Report((1f, "‘SƒpƒX‚Åƒ‰ƒCƒgƒ}ƒbƒv¶¬¸”s")); return null;
+                }
+
+                // ƒfƒmƒCƒU[“K—p
+                if (settings.useDenoiser)
+                {
+                    progressReporter?.Report((0.9f, "ƒfƒmƒCƒU[“K—p’†..."));
+                    lightmapTexture = ApplyMLDenoiser(lightmapTexture);
+                    progressReporter?.Report((1f, "ƒfƒmƒCƒU[“K—pŠ®—¹"));
+                }
+
+                return lightmapTexture;
+            }
+            catch (OperationCanceledException) { progressReporter?.Report((0f, "ˆ—ƒLƒƒƒ“ƒZƒ‹")); Debug.Log("BakingCore: ˆ—ƒLƒƒƒ“ƒZƒ‹"); return null; }
+            catch (Exception ex) { progressReporter?.Report((0f, $"ƒGƒ‰[: {ex.GetType().Name}")); Debug.LogException(ex); return null; }
         }
 
+        // ‘¼‚Ìƒƒ\ƒbƒh (FindTriangleAndBarycentricCoords, CalculateBarycentricCoords, InterpolateVector3/2, CalculatePixelColor, etc.) ‚Í•ÏX‚È‚µ
+        // ... (‚±‚ê‚ç‚Ìƒƒ\ƒbƒh‚ÌƒR[ƒh‚Í‘O‰ñ‚Ì‚à‚Ì‚Æ“¯‚¶‚È‚Ì‚ÅÈ—ª) ...
         private bool FindTriangleAndBarycentricCoords(MeshDataCache meshData, Vector2 uv, out int triangleStartVertexIndex, out Vector3 barycentricCoords)
         {
-            triangleStartVertexIndex = 0;
-            barycentricCoords = Vector3.zero;
+            triangleStartVertexIndex = 0; barycentricCoords = Vector3.zero;
             for (int i = 0; i < meshData.Triangles.Length / 3; i++)
             {
-                Vector2 uv0 = meshData.UVs[meshData.Triangles[i * 3 + 0]];
-                Vector2 uv1 = meshData.UVs[meshData.Triangles[i * 3 + 1]];
-                Vector2 uv2 = meshData.UVs[meshData.Triangles[i * 3 + 2]];
+                Vector2 uv0 = meshData.UVs[meshData.Triangles[i * 3 + 0]]; Vector2 uv1 = meshData.UVs[meshData.Triangles[i * 3 + 1]]; Vector2 uv2 = meshData.UVs[meshData.Triangles[i * 3 + 2]];
                 barycentricCoords = CalculateBarycentricCoords(uv, uv0, uv1, uv2);
-                if (barycentricCoords.x >= -1e-4f && barycentricCoords.y >= -1e-4f && barycentricCoords.z >= -1e-4f &&
-                    barycentricCoords.x <= 1.0001f && barycentricCoords.y <= 1.0001f && barycentricCoords.z <= 1.0001f)
+                if (barycentricCoords.x >= -1e-4f && barycentricCoords.y >= -1e-4f && barycentricCoords.z >= -1e-4f && barycentricCoords.x <= 1.0001f && barycentricCoords.y <= 1.0001f && barycentricCoords.z <= 1.0001f)
                 {
-                    triangleStartVertexIndex = i;
-                    return true;
+                    triangleStartVertexIndex = i; return true;
                 }
             }
             return false;
         }
-
         private Vector3 CalculateBarycentricCoords(Vector2 p, Vector2 a, Vector2 b, Vector2 c)
         {
-            Vector2 v0 = b - a, v1 = c - a, v2 = p - a;
-            float d00 = Vector2.Dot(v0, v0);
-            float d01 = Vector2.Dot(v0, v1);
-            float d11 = Vector2.Dot(v1, v1);
-            float d20 = Vector2.Dot(v2, v0);
-            float d21 = Vector2.Dot(v2, v1);
-            float denom = d00 * d11 - d01 * d01;
-            if (Mathf.Abs(denom) < 1e-6f) return new Vector3(-1, -1, -1);
-            float v_ = (d11 * d20 - d01 * d21) / denom;
-            float w_ = (d00 * d21 - d01 * d20) / denom;
-            float u_ = 1.0f - v_ - w_;
-            return new Vector3(u_, v_, w_);
+            Vector2 v0 = b - a, v1 = c - a, v2 = p - a; float d00 = Vector2.Dot(v0, v0); float d01 = Vector2.Dot(v0, v1); float d11 = Vector2.Dot(v1, v1); float d20 = Vector2.Dot(v2, v0); float d21 = Vector2.Dot(v2, v1);
+            float denom = d00 * d11 - d01 * d01; if (Mathf.Abs(denom) < 1e-6f) return new Vector3(-1, -1, -1);
+            float v_ = (d11 * d20 - d01 * d21) / denom; float w_ = (d00 * d21 - d01 * d20) / denom; return new Vector3(1.0f - v_ - w_, v_, w_);
         }
-
-        private Vector3 InterpolateVector3(Vector3 v0, Vector3 v1, Vector3 v2, Vector3 barycentric)
-        {
-            return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z;
-        }
-
-        private Vector2 InterpolateVector2(Vector2 v0, Vector2 v1, Vector2 v2, Vector3 barycentric)
-        {
-            return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z;
-        }
+        private Vector3 InterpolateVector3(Vector3 v0, Vector3 v1, Vector3 v2, Vector3 barycentric) { return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z; }
+        private Vector2 InterpolateVector2(Vector2 v0, Vector2 v1, Vector2 v2, Vector3 barycentric) { return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z; }
 
         private (Color color, float bentNormalY, int unoccludedRays) CalculatePixelColor(
             Vector3 worldPos, Vector3 worldNormal, Material material,
-            Vector2 lightmapUV,
-            Vector2 materialSampleUV)
+            Vector2 lightmapUV, Vector2 materialSampleUV)
         {
             MaterialProperties matProps = GetMaterialProperties(material);
             Color albedo = matProps.GetSampledBaseColor(materialSampleUV);
@@ -384,10 +480,7 @@ namespace RTCK.NeuraBake.Runtime
                 Color lightColorAtPoint = light.color * light.intensity;
                 float attenuation = 1.0f;
 
-                if (light.type == LightType.Directional)
-                {
-                    lightDir = -light.transform.forward;
-                }
+                if (light.type == LightType.Directional) { lightDir = -light.transform.forward; }
                 else
                 {
                     Vector3 lightToPointVec = worldPos - light.transform.position;
@@ -408,90 +501,24 @@ namespace RTCK.NeuraBake.Runtime
                     }
                 }
 
-                float shadowAccumulator = 0f;
-                int actualShadowSamples = Mathf.Max(1, settings.shadowSamples);
-                for (int i = 0; i < actualShadowSamples; i++)
-                {
-                    Vector3 jitteredLightDir = lightDir;
-                    Vector3 shadowRayOrigin = worldPos + worldNormal * 0.001f;
-
-                    if (actualShadowSamples > 1)
-                    {
-                        Vector3 randomOffset = UnityEngine.Random.onUnitSphere * 0.05f;
-                        jitteredLightDir = (lightDir + randomOffset).normalized;
-                    }
-
-                    Ray shadowRay = new Ray(shadowRayOrigin, -jitteredLightDir);
-                    float maxShadowDist = (light.type == LightType.Directional) ? 2000f : Vector3.Distance(worldPos, light.transform.position);
-                    if (!Physics.Raycast(shadowRay, maxShadowDist - 0.002f))
-                    {
-                        shadowAccumulator += 1.0f;
-                    }
-                }
-                float shadowFactor = shadowAccumulator / actualShadowSamples;
+                float maxShadowDist = (light.type == LightType.Directional) ? 2000f : Vector3.Distance(worldPos, light.transform.position);
+                float shadowFactor = CalculateShadowFactor(worldPos, worldNormal, lightDir, maxShadowDist, settings.shadowSamples);
 
                 if (shadowFactor > 0)
                 {
                     Vector3 viewDir = worldNormal;
-                    Color directLight = CalculatePBRDirectLight(
-                        lightDir, viewDir, worldNormal,
-                        lightColorAtPoint * attenuation * shadowFactor,
-                        albedo, metallic, roughness
-                    );
+                    Color directLight = CalculateAdvancedPBRDirectLight(lightDir, viewDir, worldNormal, lightColorAtPoint * attenuation * shadowFactor, albedo, metallic, roughness);
                     finalColor += directLight;
                 }
             }
 
-            foreach (NeuraBakeEmissiveSurface emissiveSurface in emissiveSurfaces)
+            if (emissiveSurfaces.Length > 0)
             {
-                MeshFilter emissiveMeshFilter = emissiveSurface.GetComponent<MeshFilter>();
-                Renderer emissiveRenderer = emissiveSurface.GetComponent<Renderer>();
-                if (emissiveMeshFilter == null || emissiveMeshFilter.sharedMesh == null || emissiveRenderer == null) continue;
-
-                Mesh emissiveMesh = emissiveMeshFilter.sharedMesh;
-                int emissiveSamplePoints = 16;
-
-                for (int i = 0; i < emissiveSamplePoints; i++)
-                {
-                    int randomTriangleIndex = UnityEngine.Random.Range(0, emissiveMesh.triangles.Length / 3);
-                    Vector3 b = GetRandomBarycentricCoords();
-
-                    int vIdx0 = emissiveMesh.triangles[randomTriangleIndex * 3 + 0];
-                    int vIdx1 = emissiveMesh.triangles[randomTriangleIndex * 3 + 1];
-                    int vIdx2 = emissiveMesh.triangles[randomTriangleIndex * 3 + 2];
-
-                    Vector3 emissivePointLocal = InterpolateVector3(emissiveMesh.vertices[vIdx0], emissiveMesh.vertices[vIdx1], emissiveMesh.vertices[vIdx2], b);
-                    Vector3 emissiveNormalLocal = InterpolateVector3(emissiveMesh.normals[vIdx0], emissiveMesh.normals[vIdx1], emissiveMesh.normals[vIdx2], b).normalized;
-
-                    Vector3 emissivePointWorld = emissiveSurface.transform.TransformPoint(emissivePointLocal);
-                    Vector3 emissiveNormalWorld = emissiveSurface.transform.TransformDirection(emissiveNormalLocal).normalized;
-
-                    Vector3 dirToEmissive = emissivePointWorld - worldPos;
-                    float distToEmissiveSqr = dirToEmissive.sqrMagnitude;
-                    float distToEmissive = Mathf.Sqrt(distToEmissiveSqr);
-                    Vector3 normalizedDirToEmissive = dirToEmissive / distToEmissive;
-
-                    float NdotL_emissive = Mathf.Max(0, Vector3.Dot(worldNormal, normalizedDirToEmissive));
-                    float NdotL_source = Mathf.Max(0, Vector3.Dot(emissiveNormalWorld, -normalizedDirToEmissive));
-
-                    if (NdotL_emissive > 0 && NdotL_source > 0)
-                    {
-                        Ray visibilityRay = new Ray(worldPos + worldNormal * 0.001f, normalizedDirToEmissive);
-                        if (!Physics.Raycast(visibilityRay, distToEmissive - 0.002f))
-                        {
-                            Color emissiveLightColor = emissiveSurface.emissiveColor * emissiveSurface.intensity * settings.emissiveBoost;
-                            float formFactorApprox = (NdotL_emissive * NdotL_source) / (Mathf.PI * distToEmissiveSqr + 1e-4f);
-                            formFactorApprox /= emissiveSamplePoints;
-
-                            Color contribution = (albedo / Mathf.PI) * emissiveLightColor * formFactorApprox;
-                            finalColor += contribution;
-                        }
-                    }
-                }
+                finalColor += CalculateEmissiveContribution(worldPos, worldNormal, albedo);
             }
 
             float occlusionFactor = 0f;
-            float bentNormalYComponent = 0f;
+            float bentNormalYComponent = worldNormal.y;
             int unoccludedRayCount = 0;
 
             if (settings.useAmbientOcclusion && settings.aoSampleCount > 0)
@@ -501,167 +528,632 @@ namespace RTCK.NeuraBake.Runtime
             }
             else if (settings.directional)
             {
-                bentNormalYComponent = worldNormal.y;
-                unoccludedRayCount = 1;
+                unoccludedRayCount = 1; // For bent normal calculation, even if AO is off
             }
 
-            // ƒJƒ‰[ƒXƒy[ƒX•â³‚ğ“K—p
-            finalColor = ApplyColorSpaceCorrection(finalColor);
+            if (IsUVSeamEdge(GetMeshData(material.mainTexture as Mesh), lightmapUV))
+            {
+                // ƒV[ƒ€‹ß‚­‚Å‚Í“Á•Ê‚Èˆ—‚ğs‚¤
+                // —á: üˆÍ‚ÌƒsƒNƒZƒ‹‚©‚çTd‚ÉF‚ğ•âŠÔ‚·‚é
+            }
 
+            // F‹óŠÔ•â³‚ÍAÅI“I‚ÉƒeƒNƒXƒ`ƒƒ‚É‘‚«‚Ş’¼‘O‚©A•\¦‚És‚¤‚Ì‚ªˆê”Ê“IB
+            // CalculatePixelColor“à‚Å–ˆ‰ñs‚¤‚ÆA‰ÁZ•½‹Ï‚ÌÛ‚ÉƒŠƒjƒAƒŠƒeƒB‚ª¸‚í‚ê‚é‰Â”\«‚ª‚ ‚éB
+            // finalColor = ApplyColorSpaceCorrection(finalColor);
             return (finalColor, bentNormalYComponent, unoccludedRayCount);
         }
-
-        private Vector3 GetRandomBarycentricCoords()
+        private Color CalculateEmissiveContribution(Vector3 worldPos, Vector3 worldNormal, Color albedo)
         {
-            float r1 = UnityEngine.Random.value;
-            float r2 = UnityEngine.Random.value;
-            float sqrtR1 = Mathf.Sqrt(r1);
-            return new Vector3(1.0f - sqrtR1, sqrtR1 * (1.0f - r2), sqrtR1 * r2);
-        }
+            Color totalEmissiveContribution = Color.black;
+            foreach (NeuraBakeEmissiveSurface emissiveSurface in emissiveSurfaces)
+            {
+                MeshFilter emissiveMeshFilter = emissiveSurface.GetComponent<MeshFilter>();
+                if (emissiveMeshFilter?.sharedMesh == null) continue;
 
+                Mesh emissiveMesh = emissiveMeshFilter.sharedMesh;
+                int emissiveSamplePoints = 16;
+                Color accumulatedLightFromThisSurface = Color.black;
+
+                for (int i = 0; i < emissiveSamplePoints; i++)
+                {
+                    Vector3 b = GetRandomBarycentricCoords();
+                    int randomTriangleStartIdx = Random.Range(0, emissiveMesh.triangles.Length / 3) * 3;
+                    if (randomTriangleStartIdx + 2 >= emissiveMesh.triangles.Length) continue; // ”z—ñ‹«ŠEƒ`ƒFƒbƒN
+
+                    int vIdx0 = emissiveMesh.triangles[randomTriangleStartIdx + 0];
+                    int vIdx1 = emissiveMesh.triangles[randomTriangleStartIdx + 1];
+                    int vIdx2 = emissiveMesh.triangles[randomTriangleStartIdx + 2];
+
+                    // ’¸“_ƒCƒ“ƒfƒbƒNƒX‚Ì‹«ŠEƒ`ƒFƒbƒN
+                    if (vIdx0 >= emissiveMesh.vertexCount || vIdx1 >= emissiveMesh.vertexCount || vIdx2 >= emissiveMesh.vertexCount) continue;
+
+
+                    Vector3 emissivePointLocal = InterpolateVector3(emissiveMesh.vertices[vIdx0], emissiveMesh.vertices[vIdx1], emissiveMesh.vertices[vIdx2], b);
+                    Vector3 emissiveNormalLocal = InterpolateVector3(emissiveMesh.normals[vIdx0], emissiveMesh.normals[vIdx1], emissiveMesh.normals[vIdx2], b).normalized;
+                    Vector3 emissivePointWorld = emissiveSurface.transform.TransformPoint(emissivePointLocal);
+                    Vector3 emissiveNormalWorld = emissiveSurface.transform.TransformDirection(emissiveNormalLocal).normalized;
+
+                    Vector3 dirToEmissive = emissivePointWorld - worldPos;
+                    float distToEmissiveSqr = dirToEmissive.sqrMagnitude;
+                    if (distToEmissiveSqr < 1e-5f) continue;
+                    float distToEmissive = Mathf.Sqrt(distToEmissiveSqr);
+                    Vector3 normalizedDirToEmissive = dirToEmissive / distToEmissive;
+
+                    float NdotL_emissive = Mathf.Max(0, Vector3.Dot(worldNormal, normalizedDirToEmissive));
+                    float NdotL_source = Mathf.Max(0, Vector3.Dot(emissiveNormalWorld, -normalizedDirToEmissive));
+
+                    if (NdotL_emissive > 0 && NdotL_source > 0)
+                    {
+                        Ray visibilityRay = new Ray(worldPos + worldNormal * 0.001f, normalizedDirToEmissive);
+                        if (!mainRaycastCache.Raycast(visibilityRay, distToEmissive - 0.002f))
+                        {
+                            Color emissiveLightColor = emissiveSurface.emissiveColor * emissiveSurface.intensity * settings.emissiveBoost;
+                            float formFactorApprox = (NdotL_emissive * NdotL_source) / (Mathf.PI * distToEmissiveSqr + 1e-4f);
+                            Color contribution = (albedo / Mathf.PI) * emissiveLightColor * formFactorApprox;
+                            accumulatedLightFromThisSurface += contribution;
+                        }
+                    }
+                }
+                totalEmissiveContribution += accumulatedLightFromThisSurface / emissiveSamplePoints;
+            }
+            return totalEmissiveContribution;
+        }
+        private Vector3 GetRandomBarycentricCoords() { float r1 = Random.value; float r2 = Random.value; float sqrtR1 = Mathf.Sqrt(r1); return new Vector3(1.0f - sqrtR1, sqrtR1 * (1.0f - r2), sqrtR1 * r2); }
         private Color CalculateSkyLight(Vector3 worldPos, Vector3 worldNormal, Color albedo)
         {
             Color skyColor;
-            
-            if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Skybox && RenderSettings.skybox != null)
-            {
-                // ƒXƒJƒCƒ{ƒbƒNƒX‚©‚ç‚ÌŠÂ‹«Œõ‚Ì‹ß—
-                skyColor = RenderSettings.ambientSkyColor;
-                // ÀÛ‚ÌƒXƒJƒCƒ{ƒbƒNƒXƒTƒ“ƒvƒŠƒ“ƒO‚Í‚±‚±‚Å‚ÍÈ—ª‚µAambientSkyColor‚ğg—p
-            }
-            else if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Trilight)
-            {
-                float dotUp = Vector3.Dot(worldNormal, Vector3.up);
-                float upLerp = Mathf.Clamp01(dotUp);
-                float downLerp = Mathf.Clamp01(-dotUp);
-                skyColor = Color.Lerp(RenderSettings.ambientEquatorColor, RenderSettings.ambientSkyColor, upLerp);
-                skyColor = Color.Lerp(skyColor, RenderSettings.ambientGroundColor, downLerp);
-            }
-            else if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Flat)
-            {
-                skyColor = RenderSettings.ambientLight;
-            }
-            else
-            {
-                // ‚»‚Ì‘¼‚Ìƒ‚[ƒh‚Å‚ÌƒtƒH[ƒ‹ƒoƒbƒN
-                skyColor = RenderSettings.ambientSkyColor;
-            }
-            
-            // ƒJƒ‰[ƒXƒy[ƒX•â³‚ğ“K—p
-            Color result = skyColor * albedo * settings.skyIntensity * RenderSettings.ambientIntensity;
-            return ApplyColorSpaceCorrection(result);
+            if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Skybox && RenderSettings.skybox != null) { skyColor = RenderSettings.ambientSkyColor; }
+            else if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Trilight) { float dotUp = Vector3.Dot(worldNormal, Vector3.up); float upLerp = Mathf.Clamp01(dotUp); float downLerp = Mathf.Clamp01(-dotUp); skyColor = Color.Lerp(RenderSettings.ambientEquatorColor, RenderSettings.ambientSkyColor, upLerp); skyColor = Color.Lerp(skyColor, RenderSettings.ambientGroundColor, downLerp); }
+            else if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Flat) { skyColor = RenderSettings.ambientLight; }
+            else { skyColor = RenderSettings.ambientSkyColor; }
+            return skyColor * albedo * settings.skyIntensity * RenderSettings.ambientIntensity;
         }
-
-        private Color CalculatePBRDirectLight(Vector3 L, Vector3 V, Vector3 N, Color lightColor, Color albedo, float metallic, float roughness)
+        private Color CalculateAdvancedPBRDirectLight(Vector3 L, Vector3 V, Vector3 N, Color lightColor, 
+            Color albedo, float metallic, float roughness, float ior = 1.45f)
         {
+            // Šî–{“I‚ÈPBRŒvZiŠù‘¶ƒR[ƒhj
             L = L.normalized; V = V.normalized; N = N.normalized;
             Vector3 H = (L + V).normalized;
             float NdotL = Mathf.Max(0f, Vector3.Dot(N, L));
             if (NdotL <= 0f) return Color.black;
+            
             float NdotV = Mathf.Max(0f, Vector3.Dot(N, V));
             float alpha = roughness * roughness;
-            Color F0 = Color.Lerp(new Color(0.04f, 0.04f, 0.04f), albedo, metallic);
-            float D_GGX = GGX_Distribution(N, H, alpha);
-            Color F_Schlick = Fresnel_Schlick(Mathf.Max(0f, Vector3.Dot(H, V)), F0);
-            float G_SmithJointGGX = Smith_Visibility_JointGGX(N, V, L, alpha);
-            Color specular = (D_GGX * F_Schlick * G_SmithJointGGX) / (4f * NdotL * NdotV + 1e-6f);
-            Color kd = new Color(1f - metallic, 1f - metallic, 1f - metallic, 1f);
-            Color diffuse = kd * albedo / Mathf.PI;
+            
+            // IOR‚ğl—¶‚µ‚½F0ŒvZ
+            float f0 = Mathf.Pow((ior - 1) / (ior + 1), 2);
+            Color F0 = Color.Lerp(new Color(f0, f0, f0), albedo, metallic);
+            
+            // ‘½dU—GGX
+            float Vis = ImprovedVisibilityTerm(NdotL, NdotV, roughness);
+            float D = ImprovedGGXDistribution(N, H, alpha);
+            Color F = ImprovedFresnelTerm(Mathf.Max(0f, Vector3.Dot(H, V)), F0);
+            
+            // ƒGƒlƒ‹ƒM[•Û‘¶‚ğl—¶‚µ‚½ŠgU”½Ë
+            Color kd = Color.Lerp(Color.white - F, Color.black, metallic);
+            float energyFactor = EnergyCompensation(roughness, NdotV);
+            Color diffuse = kd * albedo / Mathf.PI * energyFactor;
+            
+            // ‘½dU—‚ğl—¶‚µ‚½‹¾–Ê”½Ë
+            Color specular = (D * F * Vis) / (4f * NdotL * NdotV + 1e-6f);
+            
             return (diffuse + specular) * lightColor * NdotL;
         }
 
-        private float GGX_Distribution(Vector3 N, Vector3 H, float alpha)
+        private float EnergyCompensation(float roughness, float NdotV)
         {
-            float NdotH = Mathf.Max(0f, Vector3.Dot(N, H));
-            float alphaSq = alpha * alpha;
-            float denom = NdotH * NdotH * (alphaSq - 1f) + 1f;
-            return alphaSq / (Mathf.PI * denom * denom);
+            // DisneyŠgUƒ‚ƒfƒ‹‚ÉŠî‚Ã‚­ƒGƒlƒ‹ƒM[•â
+            float energyBias = Mathf.Lerp(0, 0.5f, roughness);
+            float energyFactor = Mathf.Lerp(1.0f, 1.0f / 1.51f, roughness);
+            float fd90 = energyBias + 2.0f * roughness * NdotV * NdotV;
+            float f0 = 1.0f;
+            float lightScatter = f0 + (fd90 - f0) * Mathf.Pow(1.0f - NdotV, 5.0f);
+            return lightScatter * energyFactor;
         }
+        private Color Fresnel_Schlick(float cosTheta, Color F0) { return F0 + (Color.white - F0) * Mathf.Pow(1f - Mathf.Max(0, cosTheta), 5f); } // Ensure cosTheta is not negative
+        private float GGX_Distribution(Vector3 N, Vector3 H, float alpha) { float NdotH = Mathf.Max(0f, Vector3.Dot(N, H)); float alphaSq = alpha * alpha; float denom = NdotH * NdotH * (alphaSq - 1f) + 1f; return alphaSq / (Mathf.PI * denom * denom + 1e-7f); } // Added epsilon to denominator
+        private float Smith_Visibility_JointGGX(Vector3 N, Vector3 V, Vector3 L, float alpha) { float NdotV_ = Mathf.Max(Vector3.Dot(N, V), 0.0f) + 1e-5f; float NdotL_ = Mathf.Max(Vector3.Dot(N, L), 0.0f) + 1e-5f; float roughness_sq = alpha * alpha; float G_SmithV = (2.0f * NdotV_) / (NdotV_ + Mathf.Sqrt(roughness_sq + (1.0f - roughness_sq) * NdotV_ * NdotV_)); float G_SmithL = (2.0f * NdotL_) / (NdotL_ + Mathf.Sqrt(roughness_sq + (1.0f - roughness_sq) * NdotL_ * NdotL_)); return G_SmithV * G_SmithL; }
 
-        private Color Fresnel_Schlick(float cosTheta, Color F0)
-        {
-            return F0 + (new Color(1f - F0.r, 1f - F0.g, 1f - F0.b)) * Mathf.Pow(1f - cosTheta, 5f);
-        }
-
-        private float Smith_Visibility_JointGGX(Vector3 N, Vector3 V, Vector3 L, float alpha)
-        {
-            float NdotV = Mathf.Max(0f, Vector3.Dot(N, V));
-            float NdotL = Mathf.Max(0f, Vector3.Dot(N, L));
-            float k_direct = (alpha + 2f * Mathf.Sqrt(alpha) + 1f) / 8f;
-            float G_V = NdotV / (NdotV * (1f - k_direct) + k_direct + 1e-5f);
-            float G_L = NdotL / (NdotL * (1f - k_direct) + k_direct + 1e-5f);
-            return G_V * G_L;
-        }
 
         private (float occlusion, float bentNormalY, int unoccludedRays) CalculateAmbientOcclusionAndBentNormal(Vector3 position, Vector3 normal, int sampleCount)
         {
             if (sampleCount <= 0) return (0f, normal.y, 0);
 
-            float occlusionFactor = 0f;
+            float sumOcclusionFactor = 0f; // C³: floatŒ^‚È‚Ì‚ÅInterlocked‚Íg‚¦‚È‚¢BŒã‚Ålock‚·‚éB
             Vector3 accumulatedUnoccludedNormal = Vector3.zero;
-            int unoccludedRayCount = 0;
+            int unoccludedRayCountAtomic = 0; // ‚±‚¿‚ç‚ÍInterlocked‰Â”\
             float maxAoDistance = 2.0f;
 
-            for (int i = 0; i < sampleCount; i++)
+            Vector3[] sampleDirections = new Vector3[sampleCount];
+            for (int i = 0; i < sampleCount; i++) { Vector3 randomDir = Random.onUnitSphere; if (Vector3.Dot(randomDir, normal) < 0) randomDir = -randomDir; sampleDirections[i] = randomDir; }
+
+            Parallel.For(0, sampleCount, i =>
             {
-                Vector3 randomDir = UnityEngine.Random.onUnitSphere;
-                if (Vector3.Dot(randomDir, normal) < 0)
+                Ray aoRay = new Ray(position + normal * 0.001f, sampleDirections[i]);
+                if (!mainRaycastCache.Raycast(aoRay, maxAoDistance))
                 {
-                    randomDir = -randomDir;
-                }
-
-                Ray aoRay = new Ray(position + normal * 0.001f, randomDir);
-
-                // æœ€é©åŒ–ã•ã‚ŒãŸãƒ¬ã‚¤ã‚­ãƒ£ã‚¹ãƒˆå‡¦ç†ï¼ˆã‚­ãƒ£ãƒƒã‚·ãƒ¥åˆ©ç”¨ï¼‰
-                if (!raycastCache.Raycast(aoRay, maxAoDistance))
-                {
-                    lock (cacheLock)
-                {
-                    accumulatedUnoccludedNormal += randomDir;
-                    unoccludedRayCount++;
+                    lock (cacheLock) { accumulatedUnoccludedNormal += sampleDirections[i]; }
+                    Interlocked.Increment(ref unoccludedRayCountAtomic);
                 }
                 else
                 {
-                    occlusionFactor += 1f;
+                    lock (cacheLock) { sumOcclusionFactor += 1f; } // šC³: lock‚ğg‚Á‚ÄsumOcclusionFactor‚ğXV
+                }
+            });
+
+            float finalOcclusion = (sampleCount > 0) ? sumOcclusionFactor / sampleCount : 0f;
+            float finalBentNormalY = normal.y;
+            if (unoccludedRayCountAtomic > 0)
+            {
+                // accumulatedUnoccludedNormal ‚Í lock “à‚ÅXV‚³‚ê‚½‚Ì‚ÅA“Ç‚İæ‚è‚à lock ‚·‚é‚©A
+                // ‚±‚Ì“_‚Å‚Í Parallel.For ‚ªŠ®—¹‚µ‚Ä‚¢‚é‚Ì‚ÅAƒƒCƒ“ƒXƒŒƒbƒh‚©‚ç‚Ì“Ç‚İæ‚è‚ÍˆÀ‘SB
+                // ‚½‚¾‚µA‘‚«‚İ‚Æƒ^ƒCƒ~ƒ“ƒO‚ªƒVƒrƒA‚Èê‡‚Í lock ‚ğ„§B
+                // ‚±‚±‚Å‚Í Parallel.For Š®—¹Œã‚Ìˆ—‚È‚Ì‚Å lock ‚È‚µ‚Å“Ç‚İæ‚éB
+                finalBentNormalY = (accumulatedUnoccludedNormal / unoccludedRayCountAtomic).normalized.y;
+            }
+            return (finalOcclusion, finalBentNormalY, unoccludedRayCountAtomic);
+        }
+        private static bool IsMaskMap(Material material, Texture2D texture) { if (texture == null || material?.shader == null) return false; bool isHDRP = material.shader.name.Contains("HDRP") || material.shader.name.Contains("High Definition"); bool isURP = material.shader.name.Contains("URP") || material.shader.name.Contains("Universal"); bool hasMaskMapProperty = material.HasProperty("_MaskMap"); return isHDRP || hasMaskMapProperty || (texture.name.Contains("_MaskMap") && isURP); }
+        private Color ApplyColorSpaceCorrection(Color color) { if (QualitySettings.activeColorSpace == ColorSpace.Gamma) return new Color(Mathf.LinearToGammaSpace(color.r), Mathf.LinearToGammaSpace(color.g), Mathf.LinearToGammaSpace(color.b), color.a); return color; }
+        private float CalculateShadowFactor(Vector3 worldPos, Vector3 worldNormal, Vector3 lightDir, float maxShadowDist, int shadowSamples)
+        {
+            if (shadowSamples <= 0) return 1.0f; float shadowAccumulator = 0f;
+            if (shadowSamples == 1) { Ray sr = new Ray(worldPos + worldNormal * 0.001f, -lightDir); return mainRaycastCache.Raycast(sr, maxShadowDist - 0.002f) ? 0.0f : 1.0f; }
+            float[] sampleResults = new float[shadowSamples];
+            Parallel.For(0, shadowSamples, i =>
+            {
+                Vector3 jld = lightDir; if (shadowSamples > 1) { jld = (lightDir + (Random.onUnitSphere * 0.05f)).normalized; } // 0.05f‚Í’²®’l
+                Ray sr = new Ray(worldPos + worldNormal * 0.001f, -jld); sampleResults[i] = mainRaycastCache.Raycast(sr, maxShadowDist - 0.002f) ? 0.0f : 1.0f;
+            });
+            for (int i = 0; i < shadowSamples; i++) shadowAccumulator += sampleResults[i];
+            return shadowAccumulator / shadowSamples;
+        }
+
+        // Job System—p Job’è‹`
+        [BurstCompile]
+        private struct ProcessPixelChunkJob : IJobParallelFor
+        {
+            [ReadOnly] public NativeArray<float3> WorldPositions;
+            [ReadOnly] public NativeArray<float3> WorldNormals;
+            [ReadOnly] public float4 SkyColorParam;
+            [ReadOnly] public float SkyIntensityParam;
+            [ReadOnly] public float AmbientIntensityParam;
+            public NativeArray<float4> ResultColors;
+
+            public void Execute(int index)
+            {
+                if (index >= WorldPositions.Length) return;
+                float3 worldPos = WorldPositions[index]; float3 worldNormal = WorldNormals[index];
+                if (math.lengthsq(worldNormal) < 0.0001f) worldNormal = new float3(0, 1, 0); else worldNormal = math.normalize(worldNormal);
+                float dotUp = math.dot(worldNormal, new float3(0, 1, 0)); float upLerp = math.clamp(dotUp, 0f, 1f);
+                float4 skyContribution = SkyColorParam * upLerp * SkyIntensityParam * AmbientIntensityParam;
+                // TODO: Implement full lighting within the job
+                ResultColors[index] = skyContribution;
+            }
+        }
+        private Texture2D ProcessPixelsWithJobSystem(Color[] outputPixelData, int width, int height, Vector3[] worldPositions, Vector3[] worldNormals, CancellationToken token)
+        {
+            int totalPixels = width * height;
+            if (worldPositions.Length != totalPixels || worldNormals.Length != totalPixels) { Debug.LogError("Job System: Array length mismatch."); return null; }
+
+            var positionsNative = new NativeArray<float3>(totalPixels, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+            var normalsNative = new NativeArray<float3>(totalPixels, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+            var colorsNative = new NativeArray<float4>(totalPixels, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+            Texture2D resultTexture = null;
+            try
+            {
+                for (int i = 0; i < totalPixels; i++) { if (token.IsCancellationRequested) throw new OperationCanceledException(token); positionsNative[i] = worldPositions[i]; normalsNative[i] = worldNormals[i]; }
+                var job = new ProcessPixelChunkJob
+                {
+                    WorldPositions = positionsNative,
+                    WorldNormals = normalsNative,
+                    SkyColorParam = new float4(RenderSettings.ambientSkyColor.r, RenderSettings.ambientSkyColor.g, RenderSettings.ambientSkyColor.b, RenderSettings.ambientSkyColor.a),
+                    SkyIntensityParam = settings.skyIntensity,
+                    AmbientIntensityParam = RenderSettings.ambientIntensity,
+                    ResultColors = colorsNative
+                };
+                JobHandle handle = job.Schedule(totalPixels, 64); handle.Complete();
+                if (token.IsCancellationRequested) throw new OperationCanceledException(token);
+                resultTexture = new Texture2D(width, height, TextureFormat.RGBAHalf, false, true);
+                Color[] tempColors = new Color[totalPixels];
+                for (int i = 0; i < totalPixels; i++) { if (token.IsCancellationRequested) throw new OperationCanceledException(token); float4 c = colorsNative[i]; tempColors[i] = new Color(c.x, c.y, c.z, c.w); }
+                resultTexture.SetPixels(tempColors); resultTexture.Apply(true, false); // Apply non-readable to save memory after CPU access
+                Array.Copy(tempColors, outputPixelData, totalPixels); // outputPixelData ‚É‚àŒ‹‰Ê‚ğƒRƒs[
+                return resultTexture;
+            }
+            catch (Exception ex) { Debug.LogError($"Job System error: {ex.Message}"); return null; }
+            finally { if (positionsNative.IsCreated) positionsNative.Dispose(); if (normalsNative.IsCreated) normalsNative.Dispose(); if (colorsNative.IsCreated) colorsNative.Dispose(); }
+        }
+
+        // GPUˆ— (ƒRƒ“ƒsƒ…[ƒgƒVƒF[ƒ_[) ƒXƒ^ƒu
+        private Texture2D ProcessWithComputeShader(MeshRenderer targetRenderer, Mesh mesh, Material targetMaterial, int textureWidth, int textureHeight, CancellationToken token, IProgress<(float percentage, string message)> progressReporter)
+        {
+            progressReporter?.Report((0.06f, "ƒRƒ“ƒsƒ…[ƒgƒVƒF[ƒ_[€”õ..."));
+            ComputeShader computeShader = InitializeComputeShader();
+            if (computeShader == null) { Debug.LogWarning("CS 'NeuraBakeGPURenderer' not found in Resources."); return null; }
+
+            RenderTexture outputRT = null;
+            List<ComputeBuffer> buffersToRelease = new List<ComputeBuffer>();
+            try
+            {
+                MeshDataCache meshData = GetMeshData(mesh);
+                outputRT = new RenderTexture(textureWidth, textureHeight, 0, RenderTextureFormat.ARGBHalf) { enableRandomWrite = true }; outputRT.Create();
+
+                Action<object[]> addBuffer = (dataArr) =>
+                {
+                    if (dataArr[0] is Vector3[]) { var buf = new ComputeBuffer(((Vector3[])dataArr[0]).Length, sizeof(float) * 3); buf.SetData((Vector3[])dataArr[0]); buffersToRelease.Add(buf); computeShader.SetBuffer((int)dataArr[2], (string)dataArr[1], buf); }
+                    else if (dataArr[0] is Vector2[]) { var buf = new ComputeBuffer(((Vector2[])dataArr[0]).Length, sizeof(float) * 2); buf.SetData((Vector2[])dataArr[0]); buffersToRelease.Add(buf); computeShader.SetBuffer((int)dataArr[2], (string)dataArr[1], buf); }
+                    else if (dataArr[0] is int[]) { var buf = new ComputeBuffer(((int[])dataArr[0]).Length, sizeof(int)); buf.SetData((int[])dataArr[0]); buffersToRelease.Add(buf); computeShader.SetBuffer((int)dataArr[2], (string)dataArr[1], buf); }
+                    else if (dataArr[0] is Vector4[]) { var buf = new ComputeBuffer(((Vector4[])dataArr[0]).Length > 0 ? ((Vector4[])dataArr[0]).Length : 1, sizeof(float) * 4); buf.SetData(((Vector4[])dataArr[0]).Length > 0 ? (Vector4[])dataArr[0] : new Vector4[] { Vector4.zero }); buffersToRelease.Add(buf); computeShader.SetBuffer((int)dataArr[2], (string)dataArr[1], buf); }
+                };
+
+                int kernel = computeShader.FindKernel("CSMain");
+                addBuffer(new object[] { meshData.Vertices, "Vertices", kernel }); addBuffer(new object[] { meshData.Normals, "Normals", kernel }); addBuffer(new object[] { meshData.UVs, "UVs", kernel }); addBuffer(new object[] { meshData.Triangles, "Triangles", kernel });
+
+                Vector4[] lightPos = new Vector4[Math.Max(1, sceneLights.Length)]; Vector4[] lightCol = new Vector4[Math.Max(1, sceneLights.Length)]; Vector4[] lightDir = new Vector4[Math.Max(1, sceneLights.Length)]; Vector4[] lightPar = new Vector4[Math.Max(1, sceneLights.Length)];
+                for (int i = 0; i < sceneLights.Length; i++) { lightPos[i] = sceneLights[i].transform.position; lightCol[i] = sceneLights[i].color * sceneLights[i].intensity; lightDir[i] = sceneLights[i].transform.forward; lightPar[i] = new Vector4((int)sceneLights[i].type, sceneLights[i].range, sceneLights[i].spotAngle, sceneLights[i].intensity); }
+                if (sceneLights.Length == 0) { lightPos[0] = lightCol[0] = lightDir[0] = lightPar[0] = Vector4.zero; }
+
+                addBuffer(new object[] { lightPos, "LightPositions", kernel }); addBuffer(new object[] { lightCol, "LightColors", kernel }); addBuffer(new object[] { lightDir, "LightDirections", kernel }); addBuffer(new object[] { lightPar, "LightParams", kernel });
+
+                computeShader.SetTexture(kernel, "Result", outputRT);
+                computeShader.SetInt("TextureWidth", textureWidth); computeShader.SetInt("TextureHeight", textureHeight);
+                computeShader.SetInt("VertexCount", meshData.Vertices.Length); computeShader.SetInt("TriangleCount", meshData.Triangles.Length / 3);
+                computeShader.SetMatrix("LocalToWorldMatrix", targetRenderer.transform.localToWorldMatrix);
+                computeShader.SetInt("LightCountActual", sceneLights.Length); // ÀÛ‚Ìƒ‰ƒCƒg”
+
+                computeShader.SetVector("CS_AmbientSkyColor", RenderSettings.ambientSkyColor); computeShader.SetVector("CS_AmbientEquatorColor", RenderSettings.ambientEquatorColor); computeShader.SetVector("CS_AmbientGroundColor", RenderSettings.ambientGroundColor);
+                computeShader.SetFloat("CS_AmbientIntensity", RenderSettings.ambientIntensity); computeShader.SetInt("CS_AmbientMode", (int)RenderSettings.ambientMode);
+                computeShader.SetFloat("CS_SkyIntensity", settings.skyIntensity);
+                computeShader.SetInt("CS_SampleCount", settings.sampleCount); computeShader.SetInt("CS_AoSampleCount", settings.aoSampleCount);
+                computeShader.SetInt("CS_ShadowSamples", settings.shadowSamples); computeShader.SetBool("CS_UseAO", settings.useAmbientOcclusion); computeShader.SetBool("CS_Directional", settings.directional);
+
+                int tgX = Mathf.CeilToInt(textureWidth / 8.0f); int tgY = Mathf.CeilToInt(textureHeight / 8.0f);
+                computeShader.Dispatch(kernel, tgX, tgY, 1);
+
+                progressReporter?.Report((0.08f, "GPUŒvZŠ®—¹AƒeƒNƒXƒ`ƒƒ•ÏŠ·..."));
+                Texture2D resTex = ConvertRenderTextureToTexture2D(outputRT);
+                if (resTex != null) resTex.name = $"{targetRenderer.gameObject.name}_Lightmap_Baked_GPU";
+                return resTex;
+            }
+            catch (Exception e) { Debug.LogError($"CS Error: {e.Message}\n{e.StackTrace}"); return null; }
+            finally { outputRT?.Release(); foreach (var b in buffersToRelease) b?.Release(); }
+        }
+
+        private ComputeShader InitializeComputeShader()
+        {
+            ComputeShader shader = Resources.Load<ComputeShader>("NeuraBakeGPURenderer");
+            if (shader == null)
+            {
+                Debug.LogError("NeuraBakeGPURenderer compute shader not found!");
+                return null;
+            }
+            
+            // ‚“x‚ÈƒŒƒ“ƒ_ƒŠƒ“ƒOİ’è
+            int kernel = shader.FindKernel("CSMain");
+            shader.SetBool("UseImportanceSampling", true);
+            shader.SetBool("UseDenoising", settings.useDenoiser);
+            shader.SetInt("MaxBounces", settings.bounceCount);
+            shader.SetFloat("FilterRadius", 0.01f); // ‹«ŠEˆ——pƒtƒBƒ‹ƒ^”¼Œa
+            
+            return shader;
+        }
+
+        // ‰ü—Ç‚³‚ê‚½ƒGƒbƒWƒpƒfƒBƒ“ƒOˆ—
+        private static void DilationEdgePadding(Color[] pixels, int width, int height, int iterations = 2)
+        {
+            if (pixels == null || pixels.Length != width * height) return;
+            Color[] tempPixels = new Color[pixels.Length]; // ì‹Æ—p”z—ñ
+            Color[] originalPixels = new Color[pixels.Length]; // Œ³‚ÌƒsƒNƒZƒ‹ó‘Ô‚ğ•Û‘¶
+            Array.Copy(pixels, originalPixels, pixels.Length);
+
+            // UV“‡‚ğ¯•Ê‚·‚é‚½‚ß‚Ìƒ}ƒXƒN (0=–¢ˆ—, 1=—LŒø‚ÈƒsƒNƒZƒ‹, 2=ƒpƒfƒBƒ“ƒO‚³‚ê‚½ƒsƒNƒZƒ‹)
+            byte[] islandMask = new byte[pixels.Length];
+            for (int i = 0; i < pixels.Length; i++)
+            {
+                if (pixels[i].a > 0.001f) islandMask[i] = 1; // Šù‚É—LŒø‚ÈƒsƒNƒZƒ‹
+            }
+
+            for (int iter = 0; iter < iterations; iter++)
+            {
+                Array.Copy(pixels, tempPixels, pixels.Length); // Œ»İ‚ÌƒsƒNƒZƒ‹ó‘Ô‚ğƒRƒs[
+
+                for (int y = 0; y < height; y++)
+                {
+                    for (int x = 0; x < width; x++)
+                    {
+                        int currentIndex = y * width + x;
+                        if (islandMask[currentIndex] != 0) continue; // Šù‚Éˆ—Ï‚İ‚ÌƒsƒNƒZƒ‹‚ÍƒXƒLƒbƒv
+
+                        // “¯‚¶UV“‡‚É‘®‚·‚é—×ÚƒsƒNƒZƒ‹‚Ì‚İ‚©‚çF‚ğûW
+                        Color accumulatedColor = Color.black;
+                        float accumulatedWeight = 0;
+                        int validNeighborCount = 0;
+
+                        for (int dy = -1; dy <= 1; dy++)
+                        {
+                            for (int dx = -1; dx <= 1; dx++)
+                            {
+                                if (dx == 0 && dy == 0) continue; // ©•ª©g‚ÍƒXƒLƒbƒv
+                                int nx = x + dx;
+                                int ny = y + dy;
+                                if (nx >= 0 && nx < width && ny >= 0 && ny < height)
+                                {
+                                    int neighborIndex = ny * width + nx;
+                                    if (islandMask[neighborIndex] == 1) // Œ³X—LŒø‚¾‚Á‚½ƒsƒNƒZƒ‹‚Ì‚İQÆ
+                                    {
+                                        // ‹——£‚ÉŠî‚Ã‚­d‚İ•t‚¯
+                                        float weight = (dx == 0 || dy == 0) ? 1.0f : 0.7071f; // Î‚ß‚Í‹——£‚ªã2‚È‚Ì‚Åd‚İ‚ğ‰º‚°‚é
+                                        accumulatedColor += pixels[neighborIndex] * weight;
+                                        accumulatedWeight += weight;
+                                        validNeighborCount++;
+                                    }
+                                }
+                            }
+                        }
+
+                        // —LŒø‚È—×ÚƒsƒNƒZƒ‹‚ª‚ ‚éê‡‚Ì‚İF‚ğ“K—p
+                        if (validNeighborCount > 0)
+                        {
+                            // d‚İ•t‚«•½‹Ï‚ÅF‚ğŒvZ
+                            tempPixels[currentIndex] = accumulatedColor / accumulatedWeight;
+                            
+                            // ƒAƒ‹ƒtƒ@’l‚ÍŒ³‚ÌƒsƒNƒZƒ‹‚©‚ç•Ûi‚à‚µ‚­‚Í1.0‚Éİ’èj
+                            if (originalPixels[currentIndex].a < 0.001f)
+                            {
+                                tempPixels[currentIndex].a = 1.0f;
+                            }
+                            
+                            islandMask[currentIndex] = 2; // ‚±‚ÌƒsƒNƒZƒ‹‚ÍƒpƒfƒBƒ“ƒO‚³‚ê‚½
+                        }
+                    }
+                }
+
+                Array.Copy(tempPixels, pixels, pixels.Length); // •ÏX‚ğŒ³‚Ì”z—ñ‚É”½‰f
+            }
+            
+            // ÅŒã‚ÉAŒ³X‘¶İ‚µ‚Ä‚¢‚½ƒsƒNƒZƒ‹‚ÌF‚ğ•ÛiƒpƒfƒBƒ“ƒO‚Åã‘‚«‚µ‚È‚¢j
+            for (int i = 0; i < pixels.Length; i++)
+            {
+                if (islandMask[i] == 1)
+                {
+                    pixels[i] = originalPixels[i];
                 }
             }
+        }
 
-            float finalOcclusion = (sampleCount > 0) ? occlusionFactor / sampleCount : 0f;
-            float finalBentNormalY = normal.y;
-
-            if (unoccludedRayCount > 0)
+        // UV“‡¯•Ê‚ğ–‘O‚És‚¤‚½‚ß‚ÌŠÖ”
+        private static Dictionary<int, int> IdentifyUVIslands(MeshDataCache meshData)
+        {
+            Dictionary<int, int> triangleToIsland = new Dictionary<int, int>();
+            Dictionary<Vector2, List<int>> vertexUVToTriangles = new Dictionary<Vector2, List<int>>();
+            int islandCount = 0;
+            
+            // Še’¸“_UV‚©‚çQÆ‚·‚éOŠpŒ`‚ğ‹L˜^
+            for (int i = 0; i < meshData.Triangles.Length / 3; i++)
             {
-                finalBentNormalY = (accumulatedUnoccludedNormal / unoccludedRayCount).normalized.y;
+                for (int j = 0; j < 3; j++)
+                {
+                    int vertIndex = meshData.Triangles[i * 3 + j];
+                    Vector2 uv = meshData.UVs[vertIndex];
+                    
+                    if (!vertexUVToTriangles.TryGetValue(uv, out var triangles))
+                    {
+                        triangles = new List<int>();
+                        vertexUVToTriangles[uv] = triangles;
+                    }
+                    triangles.Add(i);
+                }
             }
-
-            return (finalOcclusion, finalBentNormalY, unoccludedRayCount);
+            
+            // ŠeOŠpŒ`‚É‚Â‚¢‚Ä“‡‚ğ¯•Ê
+            HashSet<int> processedTriangles = new HashSet<int>();
+            for (int i = 0; i < meshData.Triangles.Length / 3; i++)
+            {
+                if (processedTriangles.Contains(i)) continue;
+                
+                // V‚µ‚¢“‡‚ğŠJn
+                islandCount++;
+                Queue<int> queue = new Queue<int>();
+                queue.Enqueue(i);
+                processedTriangles.Add(i);
+                triangleToIsland[i] = islandCount;
+                
+                while (queue.Count > 0)
+                {
+                    int triangleIndex = queue.Dequeue();
+                    // ‚±‚ÌOŠpŒ`‚ÌŠe’¸“_‚©‚çÚ‘±‚·‚éOŠpŒ`‚ğŒŸõ
+                    for (int j = 0; j < 3; j++)
+                    {
+                        int vertIndex = meshData.Triangles[triangleIndex * 3 + j];
+                        Vector2 uv = meshData.UVs[vertIndex];
+                        
+                        foreach (int connectedTriangle in vertexUVToTriangles[uv])
+                        {
+                            if (!processedTriangles.Contains(connectedTriangle))
+                            {
+                                processedTriangles.Add(connectedTriangle);
+                                triangleToIsland[connectedTriangle] = islandCount;
+                                queue.Enqueue(connectedTriangle);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            return triangleToIsland;
         }
 
-        private static bool IsMaskMap(Material material, Texture2D texture)
+        // UVƒV[ƒ€‚ğŒŸo‚µ‚Äƒ}ƒXƒN‚·‚éƒwƒ‹ƒp[ŠÖ”
+        private static bool IsUVSeamEdge(MeshDataCache meshData, Vector2 uv, float threshold = 0.01f)
         {
-            if (texture == null) return false;
-
-            bool isHDRP = material.shader.name.Contains("HDRP") ||
-                          material.shader.name.Contains("High Definition");
-            bool isURP = material.shader.name.Contains("URP") ||
-                         material.shader.name.Contains("Universal");
-
-            bool hasMaskMapProperty = material.HasProperty("_MaskMap");
-
-            return isHDRP || hasMaskMapProperty ||
-                   (texture.name.Contains("_MaskMap") && isURP);
+            // UV‚ÌÀ•W‚ªƒƒbƒVƒ…‚Ì•Ó‚É‹ß‚¢‚©‚Ç‚¤‚©‚ğŠm”F
+            for (int i = 0; i < meshData.Triangles.Length; i += 3)
+            {
+                Vector2 uv0 = meshData.UVs[meshData.Triangles[i]];
+                Vector2 uv1 = meshData.UVs[meshData.Triangles[i + 1]];
+                Vector2 uv2 = meshData.UVs[meshData.Triangles[i + 2]];
+                
+                // OŠpŒ`‚ÌƒGƒbƒW‚É‹ß‚¢‚©ƒ`ƒFƒbƒN
+                float dist1 = PointToLineDistance(uv, uv0, uv1);
+                float dist2 = PointToLineDistance(uv, uv1, uv2);
+                float dist3 = PointToLineDistance(uv, uv2, uv0);
+                
+                if (dist1 < threshold || dist2 < threshold || dist3 < threshold)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
-        private Color ApplyColorSpaceCorrection(Color color)
+        private static float PointToLineDistance(Vector2 p, Vector2 a, Vector2 b)
         {
-            if (QualitySettings.activeColorSpace == ColorSpace.Gamma)
-                return new Color(
-                    Mathf.LinearToGammaSpace(color.r),
-                    Mathf.LinearToGammaSpace(color.g),
-                    Mathf.LinearToGammaSpace(color.b),
-                    color.a
-                );
-            return color;
+            Vector2 ab = b - a;
+            Vector2 ap = p - a;
+            
+            if (Vector2.Dot(ab, ap) <= 0) return ap.magnitude; // “_P‚Íü•ª‚ÌŠOiA‚æ‚è‚à‘Oj
+            
+            Vector2 bp = p - b;
+            if (Vector2.Dot(ab, bp) >= 0) return bp.magnitude; // “_P‚Íü•ª‚ÌŠOiB‚æ‚è‚àŒãj
+            
+            return Mathf.Abs(ab.x * ap.y - ab.y * ap.x) / ab.magnitude; // “_‚Æü‚Ì‹——£
         }
+
+        // ‹óŠÔ•ªŠ„‚É‚æ‚éÅ“K‰»
+        private void BuildAccelerationStructure()
+        {
+            // BVHi‹«ŠEƒ{ƒŠƒ…[ƒ€ŠK‘wj\’z
+            BVHNode rootNode = new BVHNode();
+            List<Triangle> allTriangles = new List<Triangle>();
+            
+            // ƒƒbƒVƒ…‚©‚çOŠpŒ`ƒf[ƒ^ûW
+            foreach (MeshRenderer renderer in staticRenderers)
+            {
+                Mesh mesh = renderer.GetComponent<MeshFilter>().sharedMesh;
+                if (mesh == null) continue;
+                
+                Matrix4x4 localToWorld = renderer.transform.localToWorldMatrix;
+                for (int i = 0; i < mesh.triangles.Length; i += 3)
+                {
+                    Triangle tri = new Triangle(
+                        localToWorld.MultiplyPoint(mesh.vertices[mesh.triangles[i]]),
+                        localToWorld.MultiplyPoint(mesh.vertices[mesh.triangles[i + 1]]),
+                        localToWorld.MultiplyPoint(mesh.vertices[mesh.triangles[i + 2]]),
+                        renderer
+                    );
+                    allTriangles.Add(tri);
+                }
+            }
+            
+            // BVH‚Ì\’zi•ªŠ„ƒAƒ‹ƒSƒŠƒYƒ€j
+            rootNode.Build(allTriangles, 0);
+            accelerationStructure = rootNode;
+        }
+
+        // ƒvƒƒOƒŒƒbƒVƒuƒŒƒ“ƒ_ƒŠƒ“ƒO‚Ì‚½‚ß‚Ìİ’è
+        private IEnumerator RenderProgressively(int targetWidth, int targetHeight)
+        {
+            // ’iŠK“I‚É‰ğ‘œ“x‚ğã‚°‚é
+            int[] resolutionSteps = { 64, 128, 256, 512, targetWidth };
+            int currentSamples = 0;
+            
+            foreach (int resolution in resolutionSteps)
+            {
+                // ’á‰ğ‘œ“x‚ÅƒŒƒ“ƒ_ƒŠƒ“ƒO
+                int scaledWidth = Mathf.Min(resolution, targetWidth);
+                int scaledHeight = Mathf.Min(resolution, targetHeight);
+                
+                Color[] pixels = new Color[scaledWidth * scaledHeight];
+                RenderWithSamples(pixels, scaledWidth, scaledHeight, 4); // ­‚È‚¢ƒTƒ“ƒvƒ‹”‚Å‘f‘‚­
+                
+                // ƒvƒŒƒrƒ…[•\¦
+                previewTexture = new Texture2D(scaledWidth, scaledHeight);
+                previewTexture.SetPixels(pixels);
+                previewTexture.Apply();
+                
+                yield return new WaitForSeconds(0.1f);
+                
+                // \•ª‚È‰ğ‘œ“x‚É’B‚µ‚½‚çAƒTƒ“ƒvƒ‹”‚ğ‘‚â‚·•û®‚ÉØ‚è‘Ö‚¦
+                if (scaledWidth == targetWidth)
+                {
+                    while (currentSamples < settings.sampleCount)
+                    {
+                        int samplesToAdd = Mathf.Min(4, settings.sampleCount - currentSamples);
+                        currentSamples += samplesToAdd;
+                        
+                        RenderWithSamples(pixels, scaledWidth, scaledHeight, samplesToAdd, accumulate: true);
+                        previewTexture.SetPixels(pixels);
+                        previewTexture.Apply();
+                        
+                        progressReporter?.Report(((float)currentSamples / settings.sampleCount, 
+                            $"ƒvƒƒOƒŒƒbƒVƒuƒTƒ“ƒvƒŠƒ“ƒO: {currentSamples}/{settings.sampleCount}"));
+                        yield return new WaitForSeconds(0.2f);
+                    }
+                }
+            }
+        }
+
+        // ML-Opsƒx[ƒX‚ÌƒfƒmƒCƒU[iŠT”OƒR[ƒhj
+        private Texture2D ApplyMLDenoiser(Texture2D noisyTexture)
+        {
+            // ƒoƒƒƒgƒŠƒbƒNƒoƒbƒtƒ@‚Ì€”õ
+            RenderTexture albedoBuffer = CreateAuxiliaryBuffer(noisyTexture.width, noisyTexture.height);
+            RenderTexture normalBuffer = CreateAuxiliaryBuffer(noisyTexture.width, noisyTexture.height);
+            RenderTexture positionBuffer = CreateAuxiliaryBuffer(noisyTexture.width, noisyTexture.height);
+            
+            // G-Bufferƒf[ƒ^‚ğ¶¬
+            GenerateGBuffers(albedoBuffer, normalBuffer, positionBuffer);
+            
+            // AI/MLƒ‚ƒfƒ‹‚ğg—p‚µ‚½ƒfƒmƒCƒWƒ“ƒO
+            // ’: ÀÛ‚ÌÀ‘•‚Å‚ÍBarracuda/TensorFlow‚È‚Ç‚ğg—p
+            ModelExecutioner modelExecutioner = new ModelExecutioner("Assets/RTCK/NeuraBake/ML/denoiser_model.onnx");
+            Dictionary<string, Texture> inputs = new Dictionary<string, Texture>()
+            {
+                { "noisy", noisyTexture },
+                { "albedo", albedoBuffer },
+                { "normal", normalBuffer },
+                { "position", positionBuffer }
+            };
+            
+            RenderTexture result = modelExecutioner.Execute(inputs);
+            
+            // Œ‹‰Ê‚ğTexture2D‚É•ÏŠ·‚µ‚Ä•Ô‚·
+            return ConvertRenderTextureToTexture2D(result);
+        }
+    }
+
+    // IESƒvƒƒtƒ@ƒCƒ‹‘Î‰‚ÌŒõŒ¹ƒNƒ‰ƒX
+    public class IESLight
+    {
+        private float[] intensityData;
+        private int verticalSamples;
+        private int horizontalSamples;
+        
+        public IESLight(string iesFilePath)
+        {
+            // IESƒtƒ@ƒCƒ‹‚Ì‰ğÍ‚Æ“Ç‚İ‚İ
+            ParseIESFile(iesFilePath);
+        }
+        
+        public float GetIntensity(Vector3 direction)
+        {
+            // •ûŒü‚©‚çŠp“x‚ğŒvZ
+            float verticalAngle = Mathf.Acos(direction.y) * Mathf.Rad2Deg;
+            float horizontalAngle = Mathf.Atan2(direction.z, direction.x) * Mathf.Rad2Deg;
+            
+            // Šp“x‚©‚çƒf[ƒ^ƒCƒ“ƒfƒbƒNƒX‚ğŒvZ
+            int vertIndex = Mathf.FloorToInt(verticalAngle / 180f * (verticalSamples - 1));
+            int horizIndex = Mathf.FloorToInt((horizontalAngle + 180f) / 360f * (horizontalSamples - 1));
+            
+            // ƒCƒ“ƒfƒbƒNƒX‚ğƒNƒ‰ƒ“ƒv
+            vertIndex = Mathf.Clamp(vertIndex, 0, verticalSamples - 1);
+            horizIndex = Mathf.Clamp(horizIndex, 0, horizontalSamples - 1);
+            
+            return intensityData[vertIndex * horizontalSamples + horizIndex];
+        }
+        
+        // IESƒtƒ@ƒCƒ‹‰ğÍƒƒ\ƒbƒh
+        private void ParseIESFile(string path) { /* IESƒtƒ@ƒCƒ‹‰ğÍƒƒWƒbƒN */ }
     }
 }

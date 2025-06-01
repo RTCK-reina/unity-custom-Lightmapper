@@ -3,6 +3,13 @@ using UnityEngine;
 
 namespace RTCK.NeuraBake.Runtime
 {
+    public enum LightmapRendererType
+    {
+        core, // 検証用ベース
+        CPU_Spectral_Renderer, // 光分散実証用
+        GPU_Renderer // GPU実証用
+    }
+
     [Serializable]
     public class NeuraBakeSettings
     {
@@ -58,6 +65,9 @@ namespace RTCK.NeuraBake.Runtime
         [Range(0.0f, 5.0f)]
         public float skyIntensity = DefaultSkyIntensity;
 
+        [Tooltip("レンダラー種別")]
+        public LightmapRendererType rendererType = LightmapRendererType.core;
+
         public NeuraBakeSettings() { }
 
         public void Reset()
@@ -73,6 +83,7 @@ namespace RTCK.NeuraBake.Runtime
             shadowSamples = DefaultShadowSamples;
             emissiveBoost = DefaultEmissiveBoost;
             skyIntensity = DefaultSkyIntensity;
+            rendererType = LightmapRendererType.core;
         }
 
         public (bool, string) Validate()

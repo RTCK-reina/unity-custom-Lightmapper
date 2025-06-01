@@ -2,6 +2,8 @@ using RTCK.NeuraBake.Runtime;
 using System;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
+using System.Collections.Generic;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
@@ -69,6 +71,11 @@ namespace RTCK.NeuraBake.Editor
             }
 
             EditorGUI.BeginChangeCheck();
+
+            // レンダラー種別選択
+            settings.rendererType = (LightmapRendererType)EditorGUILayout.EnumPopup(
+                new GUIContent("レンダラー種別", "使用するライトマップレンダラーを選択"),
+                settings.rendererType);
 
             GUILayout.Label("全般設定", EditorStyles.boldLabel);
             settings.resolution = EditorGUILayout.FloatField(new GUIContent("テクセル解像度", "ワールドユニットあたりのテクセル数。"), settings.resolution);
@@ -266,7 +273,19 @@ namespace RTCK.NeuraBake.Editor
 
             try
             {
-                BakingCore bakingCore = new BakingCore(settings);
+                ILightmapRenderer renderer;
+                switch (settings.rendererType)
+                {
+                    case LightmapRendererType.CPU_Spectral_Renderer:
+                        renderer = new CPU_Spectral_Renderer(settings);
+                        break;
+                    case LightmapRendererType.GPU_Renderer:
+                        renderer = new GPU_Renderer(settings);
+                        break;
+                    default:
+                        renderer = new BakingCore(settings); // 修正: 必要な引数 'settings' を渡す
+                        break;
+                }
 
                 var progressReporter = new Progress<(float percentage, string message)>(update =>
                 {
@@ -278,7 +297,7 @@ namespace RTCK.NeuraBake.Editor
                 bakeStatusMessage = "ライトマップ生成中...";
                 Repaint();
 
-                Texture2D lightmapTexture = await bakingCore.BakeLightmapAsync(
+                Texture2D lightmapTexture = await renderer.RenderAsync(
                     bakingCancellationSource.Token, progressReporter);
 
                 bakingCancellationSource.Token.ThrowIfCancellationRequested();

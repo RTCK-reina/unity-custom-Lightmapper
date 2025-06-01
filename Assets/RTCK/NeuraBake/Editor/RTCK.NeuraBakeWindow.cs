@@ -2,18 +2,18 @@ using RTCK.NeuraBake.Runtime;
 using System;
 using System.IO;
 using System.Threading;
-using System.Threading.Tasks;
 using UnityEditor;
+using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.SceneManagement;
+
 
 namespace RTCK.NeuraBake.Editor
 {
     public class NeuraBakeWindow : EditorWindow
     {
         private NeuraBakeSettings settings;
-        // RTCK.NeuraBakeWindows.cs 内
-        // private string settingsFilePath = "Assets/RTCK_NeuraBake_Settings.json"; // 修正前
-        private string settingsFilePath = "Assets/RTCK_NeuraBake/Settings/DefaultNeuraBakeSettings.json"; // 修正後 (例)
+        private string settingsFilePath = "Assets/RTCK_NeuraBake/Settings/DefaultNeuraBakeSettings.json";
         private Vector2 scrollPosition;
         private bool isBaking = false;
         private CancellationTokenSource bakingCancellationSource;
@@ -24,7 +24,7 @@ namespace RTCK.NeuraBake.Editor
         public static void ShowWindow()
         {
             NeuraBakeWindow window = GetWindow<NeuraBakeWindow>("NeuraBake");
-            window.minSize = new Vector2(380, 580); // UI要素に合わせて調整
+            window.minSize = new Vector2(380, 580);
             window.Show();
         }
 
@@ -70,19 +70,16 @@ namespace RTCK.NeuraBake.Editor
 
             EditorGUI.BeginChangeCheck();
 
-            // 全般設定
             GUILayout.Label("全般設定", EditorStyles.boldLabel);
             settings.resolution = EditorGUILayout.FloatField(new GUIContent("テクセル解像度", "ワールドユニットあたりのテクセル数。"), settings.resolution);
             settings.sampleCount = EditorGUILayout.IntSlider(new GUIContent("スーパーサンプリング", "1テクセルあたりのAAサンプル数。"), settings.sampleCount, 1, 64);
 
             EditorGUILayout.Space();
-            // グローバルイルミネーション
             GUILayout.Label("グローバルイルミネーション", EditorStyles.boldLabel);
             settings.bounceCount = EditorGUILayout.IntSlider(new GUIContent("バウンス回数", "間接光の反射回数。"), settings.bounceCount, 0, 10);
             settings.skyIntensity = EditorGUILayout.Slider(new GUIContent("スカイライト強度", "環境光全体の明るさ係数。"), settings.skyIntensity, 0f, 5f);
 
             EditorGUILayout.Space();
-            // アンビエントオクルージョン
             GUILayout.Label("アンビエントオクルージョン (AO)", EditorStyles.boldLabel);
             settings.useAmbientOcclusion = EditorGUILayout.Toggle(new GUIContent("AO 有効化", "オブジェクトの隙間や窪みに影を生成。"), settings.useAmbientOcclusion);
             if (settings.useAmbientOcclusion)
@@ -91,25 +88,32 @@ namespace RTCK.NeuraBake.Editor
             }
 
             EditorGUILayout.Space();
-            // シャドウ
             GUILayout.Label("シャドウ", EditorStyles.boldLabel);
             settings.shadowSamples = EditorGUILayout.IntSlider(new GUIContent("ソフトシャドウ サンプル", "1でハードシャドウ。値を上げるとソフトになるが重くなる。"), settings.shadowSamples, 1, 32);
-
 
             EditorGUILayout.Space();
             // 発光面
             GUILayout.Label("発光面 (Light Meshes)", EditorStyles.boldLabel);
             settings.emissiveBoost = EditorGUILayout.Slider(new GUIContent("発光ブースト", "NeuraBakeEmissiveSurfaceコンポーネントを持つオブジェクトの発光強度係数。"), settings.emissiveBoost, 0f, 10f);
 
-
             EditorGUILayout.Space();
             // ライトマップ出力
             GUILayout.Label("ライトマップ出力", EditorStyles.boldLabel);
             settings.directional = EditorGUILayout.Toggle(new GUIContent("指向性情報 (ベントノーマルY)", "ライトマップのAlphaチャンネルに簡易的な指向性情報（ベントノーマルY）を格納。"), settings.directional);
             settings.useDenoiser = EditorGUILayout.Toggle(new GUIContent("デノイザー有効化 (将来対応)", "ベイク結果のノイズを軽減。"), settings.useDenoiser);
-            settings.atlasSize = EditorGUILayout.IntPopup(new GUIContent("テクスチャサイズ", "生成されるライトマップテクスチャの解像度。"), settings.atlasSize,
-                new string[] { "256", "512", "1024", "2048", "4096", "8192" },
-                new int[] { 256, 512, 1024, 2048, 4096, 8192 });
+
+            // IntPopupの正しい使い方
+            string[] sizeOptions = new string[] { "256", "512", "1024", "2048", "4096", "8192" };
+            int[] sizeValues = new int[] { 256, 512, 1024, 2048, 4096, 8192 };
+            int selectedIndex = EditorGUILayout.Popup(
+                new GUIContent("テクスチャサイズ", "生成されるライトマップテクスチャの解像度。"),
+                Array.IndexOf(sizeValues, settings.atlasSize),
+                sizeOptions);
+
+            if (selectedIndex >= 0)
+            {
+                settings.atlasSize = sizeValues[selectedIndex];
+            }
 
             if (EditorGUI.EndChangeCheck())
             {
@@ -120,10 +124,6 @@ namespace RTCK.NeuraBake.Editor
                 }
             }
         }
-
-        // DrawActionButtons, DrawStatusArea, SaveSettings, SaveSettingsAs, LoadSettings,
-        // StartBakeAsync, CancelBake, SaveBakedLightmap は前回のコードから変更なしのため省略
-        // (ただし、StartBakeAsync内のBakingCore呼び出しは新しいsettingsを渡すように)
 
         private void DrawActionButtons()
         {
@@ -278,15 +278,40 @@ namespace RTCK.NeuraBake.Editor
                 bakeStatusMessage = "ライトマップ生成中...";
                 Repaint();
 
-                Texture2D lightmapTexture = await bakingCore.BakeLightmapAsync(bakingCancellationSource.Token, progressReporter);
+                Texture2D lightmapTexture = await bakingCore.BakeLightmapAsync(
+                    bakingCancellationSource.Token, progressReporter);
+
                 bakingCancellationSource.Token.ThrowIfCancellationRequested();
 
                 if (lightmapTexture != null)
                 {
-                    bakeStatusMessage = "ライトマップ保存中...";
+                    bakeStatusMessage = "ライトマップアセット保存中...";
                     Repaint();
-                    SaveBakedLightmap(lightmapTexture); // このメソッドは前回から変更なし
-                    bakeStatusMessage = "ベイク処理完了";
+
+                    string savedAssetPath = SaveBakedLightmapAndGetPath(lightmapTexture);
+
+                    if (!string.IsNullOrEmpty(savedAssetPath))
+                    {
+                        bakeStatusMessage = "シーンにライトマップを適用中...";
+                        Repaint();
+
+                        Texture2D loadedLightmapAsset = AssetDatabase.LoadAssetAtPath<Texture2D>(savedAssetPath);
+                        if (loadedLightmapAsset != null)
+                        {
+                            ApplyBakedLightmapToScene(loadedLightmapAsset);
+                            bakeStatusMessage = "ベイク処理及びシーンへの適用完了";
+                        }
+                        else
+                        {
+                            bakeStatusMessage = "ライトマップアセットのロードに失敗しました。";
+                            Debug.LogError("NeuraBake: " + bakeStatusMessage);
+                        }
+                    }
+                    else
+                    {
+                        bakeStatusMessage = "ライトマップアセットの保存に失敗しました。";
+                    }
+
                     DestroyImmediate(lightmapTexture);
                 }
                 else
@@ -322,20 +347,26 @@ namespace RTCK.NeuraBake.Editor
         {
             if (isBaking && bakingCancellationSource != null && !bakingCancellationSource.IsCancellationRequested)
             {
+                bakeStatusMessage = "ベイク処理をキャンセル中...";
+                Repaint();
+                Debug.Log("NeuraBake: ベイク処理をキャンセルしています。");
                 bakingCancellationSource.Cancel();
             }
         }
 
-        private void SaveBakedLightmap(Texture2D texture)
+        private string SaveBakedLightmapAndGetPath(Texture2D texture)
         {
-            if (texture == null) return;
-            string sceneName = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+            if (texture == null) return null;
+            string sceneName = SceneManager.GetActiveScene().name;
             if (string.IsNullOrEmpty(sceneName)) sceneName = "UntitledScene";
+
             string directoryPath = $"Assets/NeuraBake_Lightmaps/{sceneName}";
+
             if (!Directory.Exists(directoryPath))
             {
                 Directory.CreateDirectory(directoryPath);
             }
+
             string fileName = $"{sceneName}_Lightmap_{System.DateTime.Now:yyyyMMdd_HHmmss}.exr";
             string outputPath = Path.Combine(directoryPath, fileName);
 
@@ -345,6 +376,7 @@ namespace RTCK.NeuraBake.Editor
                 File.WriteAllBytes(outputPath, bytes);
                 AssetDatabase.Refresh();
                 Debug.Log($"NeuraBake: ライトマップを保存しました: {outputPath}");
+
                 TextureImporter importer = AssetImporter.GetAtPath(outputPath) as TextureImporter;
                 if (importer != null)
                 {
@@ -353,13 +385,70 @@ namespace RTCK.NeuraBake.Editor
                     importer.mipmapEnabled = false;
                     importer.SaveAndReimport();
                     Debug.Log($"NeuraBake: {outputPath} のインポート設定を更新しました。");
+                    return outputPath;
                 }
-                Selection.activeObject = AssetDatabase.LoadAssetAtPath<Texture2D>(outputPath);
+                else
+                {
+                    Debug.LogError($"NeuraBake: TextureImporterの取得に失敗しました: {outputPath}");
+                    return null;
+                }
             }
             catch (Exception e)
             {
                 Debug.LogError($"NeuraBake: ライトマップの保存に失敗しました ({outputPath}): {e.Message}");
+                return null;
             }
+        }
+
+        private void ApplyBakedLightmapToScene(Texture2D bakedLightmapAsset)
+        {
+            if (bakedLightmapAsset == null)
+            {
+                Debug.LogError("NeuraBake: シーンに適用するライトマップアセットがnullです。");
+                return;
+            }
+
+            if (LightmapSettings.lightmaps != null && LightmapSettings.lightmaps.Length > 0)
+            {
+                Debug.Log($"NeuraBake: 既存のライトマップ設定をクリアします。（{LightmapSettings.lightmaps.Length}個）");
+            }
+
+            LightmapSettings.lightmaps = null;
+
+            LightmapData newLightmapData = new LightmapData();
+            newLightmapData.lightmapColor = bakedLightmapAsset;
+
+            if (settings.directional)
+            {
+                LightmapSettings.lightmapsMode = LightmapsMode.NonDirectional;
+            }
+            else
+            {
+                LightmapSettings.lightmapsMode = LightmapsMode.NonDirectional;
+            }
+
+            LightmapData[] newLightmapsArray = new LightmapData[1];
+            newLightmapsArray[0] = newLightmapData;
+            LightmapSettings.lightmaps = newLightmapsArray;
+
+            MeshRenderer[] renderers = GameObject.FindObjectsOfType<MeshRenderer>();
+            int appliedCount = 0;
+
+            foreach (MeshRenderer renderer in renderers)
+            {
+                if (renderer.gameObject.isStatic)
+                {
+                    renderer.lightmapIndex = 0;
+                    renderer.lightmapScaleOffset = new Vector4(1, 1, 0, 0);
+                    appliedCount++;
+                }
+            }
+
+            EditorSceneManager.MarkSceneDirty(SceneManager.GetActiveScene());
+            DynamicGI.UpdateEnvironment();
+
+            Debug.Log($"NeuraBake: ライトマップをシーンの{appliedCount}個のオブジェクトに適用しました。");
+            Selection.activeObject = bakedLightmapAsset;
         }
     }
 }

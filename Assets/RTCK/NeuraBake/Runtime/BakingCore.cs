@@ -1,15 +1,73 @@
 using UnityEngine;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading.Tasks;
 using System.Threading;
 using System.Linq;
 using System;
-using Random = UnityEngine.Random; // UnityEngine.Random ‚ğ–¾¦
 
 namespace RTCK.NeuraBake.Runtime
 {
     public class BakingCore
     {
+        // RenderTexture ‚©‚ç Texture2D ‚Ö•ÏŠ·‚·‚éƒƒ\ƒbƒh
+        public static Texture2D ConvertRenderTextureToTexture2D(RenderTexture rt)
+        {
+            if (rt == null)
+            {
+                Debug.LogError("RenderTexture is null");
+                return null;
+            }
+
+            var currentRT = RenderTexture.active;
+            try
+            {
+                RenderTexture.active = rt;
+                Texture2D tex = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false);
+                tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+                tex.Apply();
+                return tex;
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"Error converting RenderTexture to Texture2D: {e.Message}");
+                return null;
+            }
+            finally
+            {
+                RenderTexture.active = currentRT;
+            }
+        }
+
+        // Texture2D ‚ğ PNG ƒtƒ@ƒCƒ‹‚Æ‚µ‚Ä•Û‘¶‚·‚éƒƒ\ƒbƒh
+        public static bool SaveTexture2DToPNG(Texture2D tex, string path)
+        {
+            if (tex == null)
+            {
+                Debug.LogError("Texture2D is null");
+                return false;
+            }
+
+            try
+            {
+                byte[] pngData = tex.EncodeToPNG();
+                if (pngData == null)
+                {
+                    Debug.LogError("Failed to encode texture to PNG");
+                    return false;
+                }
+
+                File.WriteAllBytes(path, pngData);
+                Debug.Log($"Texture saved to: {path}");
+                return true;
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"Error saving PNG file: {e.Message}");
+                return false;
+            }
+        }
+
         private readonly NeuraBakeSettings settings;
         private readonly Light[] sceneLights;
         private readonly NeuraBakeEmissiveSurface[] emissiveSurfaces; // ”­Œõ–Ê‚ğƒLƒƒƒbƒVƒ…
@@ -17,8 +75,9 @@ namespace RTCK.NeuraBake.Runtime
         private readonly Dictionary<Mesh, MeshDataCache> meshDataCache = new Dictionary<Mesh, MeshDataCache>();
         private readonly object cacheLock = new object();
 
-        private class MaterialProperties // ‘O‰ñ‚©‚ç•ÏX‚È‚µ‚Ì‚½‚ßÈ—ª (‚½‚¾‚µAGetSampledMetallicRoughness“à‚ÌSmoothness‚Ìˆµ‚¢‚ğÄŠm”F)
+        private class MaterialProperties
         {
+            public Material material; // Œ³‚Ìƒ}ƒeƒŠƒAƒ‹QÆ‚ğ•Û
             public Color BaseColor { get; }
             public float Metallic { get; }
             public float Roughness { get; }
@@ -26,26 +85,31 @@ namespace RTCK.NeuraBake.Runtime
             public Texture2D MetallicGlossMap { get; }
             public Texture2D NormalMap { get; }
             public Vector4 MainTexST { get; }
+            public float Smoothness { get; }
+            public Vector2 uvScale = Vector2.one;
+            public Vector2 uvOffset = Vector2.zero;
 
             public MaterialProperties(Material material)
             {
+                this.material = material;
                 BaseColor = material.HasProperty("_BaseColor") ? material.GetColor("_BaseColor") :
                             (material.HasProperty("_Color") ? material.GetColor("_Color") : Color.white);
                 Metallic = material.HasProperty("_Metallic") ? material.GetFloat("_Metallic") : 0f;
-                float smoothness = material.HasProperty("_Glossiness") ? material.GetFloat("_Glossiness") :
-                                  (material.HasProperty("_Smoothness") ? material.GetFloat("_Smoothness") : 0.5f);
-                Roughness = 1f - smoothness;
+                Smoothness = material.HasProperty("_Glossiness") ? material.GetFloat("_Glossiness") :
+                             (material.HasProperty("_Smoothness") ? material.GetFloat("_Smoothness") : 0.5f);
+                Roughness = 1f - Smoothness;
                 BaseColorMap = material.HasProperty("_MainTex") ? material.GetTexture("_MainTex") as Texture2D : null;
                 MetallicGlossMap = material.HasProperty("_MetallicGlossMap") ? material.GetTexture("_MetallicGlossMap") as Texture2D : null;
                 NormalMap = material.HasProperty("_BumpMap") ? material.GetTexture("_BumpMap") as Texture2D : null;
                 MainTexST = material.HasProperty("_MainTex_ST") ? material.GetVector("_MainTex_ST") : new Vector4(1, 1, 0, 0);
+                uvScale = new Vector2(MainTexST.x, MainTexST.y);
+                uvOffset = new Vector2(MainTexST.z, MainTexST.w);
             }
 
             public Color GetSampledBaseColor(Vector2 uv)
             {
                 Vector2 tiledUv = new Vector2(uv.x * MainTexST.x + MainTexST.z, uv.y * MainTexST.y + MainTexST.w);
                 Color texColor = BaseColorMap != null && BaseColorMap.isReadable ? BaseColorMap.GetPixelBilinear(tiledUv.x, tiledUv.y) : Color.white;
-                // sRGBƒeƒNƒXƒ`ƒƒ‚Ìê‡AƒŠƒjƒA‹óŠÔ‚É•ÏŠ· (Unity‚ª©“®‚Ås‚¤ê‡‚à‚ ‚é‚ªA‚±‚±‚Å‚Í–¾¦‚µ‚È‚¢BÅIo—Í‚ªƒŠƒjƒA‚È‚çOK)
                 return BaseColor * texColor;
             }
 
@@ -53,20 +117,28 @@ namespace RTCK.NeuraBake.Runtime
             {
                 Vector2 tiledUv = new Vector2(uv.x * MainTexST.x + MainTexST.z, uv.y * MainTexST.y + MainTexST.w);
                 float finalMetallic = Metallic;
-                float currentSmoothness = 1f - Roughness; // Roughness‚©‚çSmoothness‚É–ß‚·
+                float currentSmoothness = Smoothness;
 
                 if (MetallicGlossMap != null && MetallicGlossMap.isReadable)
                 {
                     Color metallicGlossSample = MetallicGlossMap.GetPixelBilinear(tiledUv.x, tiledUv.y);
-                    finalMetallic *= metallicGlossSample.r; // Standard shader: Metallic is in R channel
-                    currentSmoothness *= metallicGlossSample.a; // Standard shader: Smoothness is in A channel
+                    bool isMaskMap = IsMaskMap(material, MetallicGlossMap);
+                    if (isMaskMap)
+                    {
+                        finalMetallic = metallicGlossSample.a; // HDRP MaskMap: Metallic in A
+                        currentSmoothness = metallicGlossSample.r; // HDRP MaskMap: Roughness in R
+                    }
+                    else
+                    {
+                        finalMetallic *= metallicGlossSample.r; // Standard shader: Metallic is in R channel
+                        currentSmoothness *= metallicGlossSample.a; // Standard shader: Smoothness is in A channel
+                    }
                 }
-                return (Mathf.Clamp01(finalMetallic), 1f - Mathf.Clamp01(currentSmoothness)); // Ä“xRoughness‚É•ÏŠ·
+                return (Mathf.Clamp01(finalMetallic), 1f - Mathf.Clamp01(currentSmoothness));
             }
         }
 
-
-        private class MeshDataCache // ‘O‰ñ‚©‚ç•ÏX‚È‚µ‚Ì‚½‚ßÈ—ª
+        private class MeshDataCache
         {
             public readonly Vector3[] Vertices;
             public readonly Vector3[] Normals;
@@ -81,18 +153,16 @@ namespace RTCK.NeuraBake.Runtime
             }
         }
 
-
         public BakingCore(NeuraBakeSettings bakeSettings)
         {
             settings = bakeSettings ?? throw new ArgumentNullException(nameof(bakeSettings));
             sceneLights = GameObject.FindObjectsOfType<Light>().Where(l => l.isActiveAndEnabled && l.intensity > 0).ToArray();
-            // ”­Œõ–ÊƒRƒ“ƒ|[ƒlƒ“ƒg‚ğ‚ÂƒIƒuƒWƒFƒNƒg‚ğûW
             emissiveSurfaces = GameObject.FindObjectsOfType<NeuraBakeEmissiveSurface>()
                                          .Where(es => es.enabled && es.bakeEmissive && es.intensity > 0)
                                          .ToArray();
         }
 
-        private MaterialProperties GetMaterialProperties(Material material) // ‘O‰ñ‚©‚ç•ÏX‚È‚µ
+        private MaterialProperties GetMaterialProperties(Material material)
         {
             lock (cacheLock)
             {
@@ -105,7 +175,7 @@ namespace RTCK.NeuraBake.Runtime
             }
         }
 
-        private MeshDataCache GetMeshData(Mesh mesh) // ‘O‰ñ‚©‚ç•ÏX‚È‚µ
+        private MeshDataCache GetMeshData(Mesh mesh)
         {
             lock (cacheLock)
             {
@@ -118,8 +188,6 @@ namespace RTCK.NeuraBake.Runtime
             }
         }
 
-        // BakeLightmapAsync ‚Æ‚»‚Ìƒwƒ‹ƒp[ (FindTriangleAndBarycentricCoords, InterpolateVector3/2) ‚Í‘O‰ñ‚©‚ç‚Ù‚Ú•ÏX‚È‚µB
-        // CalculatePixelColor ‚É“n‚· surfaceUV ‚ÌƒWƒbƒ^ƒŠƒ“ƒO•”•ª‚ğ–¾Šm‰»B
         public async Task<Texture2D> BakeLightmapAsync(CancellationToken token, IProgress<(float percentage, string message)> progressReporter)
         {
             MeshRenderer[] renderers = GameObject.FindObjectsOfType<MeshRenderer>()
@@ -131,7 +199,7 @@ namespace RTCK.NeuraBake.Runtime
                 return null;
             }
 
-            MeshRenderer targetRenderer = renderers[0]; // ƒtƒF[ƒY1‚ÍÅ‰‚ÌƒŒƒ“ƒ_ƒ‰[‚Ì‚İ
+            MeshRenderer targetRenderer = renderers[0];
             Material targetMaterial = targetRenderer.sharedMaterial;
             MeshFilter meshFilter = targetRenderer.GetComponent<MeshFilter>();
 
@@ -160,7 +228,7 @@ namespace RTCK.NeuraBake.Runtime
             Color[] pixels = new Color[textureWidth * textureHeight];
             int totalPixelsToProcess = textureWidth * textureHeight;
             int processedPixels = 0;
-            float accumulatedBentNormalY = 0f; // ƒxƒ“ƒgƒm[ƒ}ƒ‹YŒvZ—p
+            float accumulatedBentNormalY = 0f;
 
             for (int y = 0; y < textureHeight; y++)
             {
@@ -178,34 +246,30 @@ namespace RTCK.NeuraBake.Runtime
                         Vector3 localPos = InterpolateVector3(meshData.Vertices[vIdx0], meshData.Vertices[vIdx1], meshData.Vertices[vIdx2], barycentricCoords);
                         Vector3 localNormal = InterpolateVector3(meshData.Normals[vIdx0], meshData.Normals[vIdx1], meshData.Normals[vIdx2], barycentricCoords).normalized;
 
-                        // ƒ‰ƒCƒgƒ}ƒbƒv—p‚ÌUVÀ•W‚ğ•âŠÔ (ƒ}ƒeƒŠƒAƒ‹ƒTƒ“ƒvƒŠƒ“ƒO‚Æ‚Í•Ê‚Ìê‡‚ª‚ ‚é)
                         Vector2 lightmapUV = InterpolateVector2(meshData.UVs[vIdx0], meshData.UVs[vIdx1], meshData.UVs[vIdx2], barycentricCoords);
-
 
                         Vector3 worldPos = targetRenderer.transform.TransformPoint(localPos);
                         Vector3 worldNormal = targetRenderer.transform.TransformDirection(localNormal).normalized;
 
                         Color accumulatedColor = Color.black;
-                        accumulatedBentNormalY = 0f; // ƒsƒNƒZƒ‹‚²‚Æ‚ÉƒŠƒZƒbƒg
+                        accumulatedBentNormalY = 0f;
                         int validAoSamplesForBentNormal = 0;
 
-                        for (int s = 0; s < settings.sampleCount; s++) // ƒX[ƒp[ƒTƒ“ƒvƒŠƒ“ƒOƒ‹[ƒv
+                        for (int s = 0; s < settings.sampleCount; s++)
                         {
                             Vector2 currentSampleUV = texelCenterUv;
-                            if (settings.sampleCount > 1) // 1ˆÈã‚Ì‚Ì‚İƒWƒbƒ^ƒŠƒ“ƒO
+                            if (settings.sampleCount > 1)
                             {
-                                float offsetX = (Random.value - 0.5f) / textureWidth; // 1ƒsƒNƒZƒ‹•“à‚Åƒ‰ƒ“ƒ_ƒ€
-                                float offsetY = (Random.value - 0.5f) / textureHeight;
+                                float offsetX = (UnityEngine.Random.value - 0.5f) / textureWidth;
+                                float offsetY = (UnityEngine.Random.value - 0.5f) / textureHeight;
                                 currentSampleUV = new Vector2(texelCenterUv.x + offsetX, texelCenterUv.y + offsetY);
-                                // ƒWƒbƒ^ƒŠƒ“ƒO‚µ‚½UV‚ªOŠpŒ`‚ÌŠO‚Éo‚é‰Â”\«‚Í’á‚¢‚ªAŒµ–§‚É‚ÍÄƒ`ƒFƒbƒN‚ª•K—v
                             }
 
-                            // CalculatePixelColor‚Í (Color, BentNormalYComponent) ‚ğ•Ô‚·‚æ‚¤‚É•ÏX
-                            (Color pixelSampleColor, float sampleBentNormalY, int unoccludedRays) colorInfo = CalculatePixelColor(worldPos, worldNormal, targetMaterial, lightmapUV, currentSampleUV /*ƒ}ƒeƒŠƒAƒ‹—pUV*/);
-                            accumulatedColor += colorInfo.pixelSampleColor;
-                            if (settings.directional && colorInfo.unoccludedRays > 0) // unoccludedRays‚ÍAOŒvZ‚ÉƒJƒEƒ“ƒg
+                            var colorInfo = CalculatePixelColor(worldPos, worldNormal, targetMaterial, lightmapUV, currentSampleUV);
+                            accumulatedColor += colorInfo.color;
+                            if (settings.directional && colorInfo.unoccludedRays > 0)
                             {
-                                accumulatedBentNormalY += colorInfo.sampleBentNormalY * colorInfo.unoccludedRays; // d‚İ•t‚¯•½‹Ï‚Ì‚½‚ß
+                                accumulatedBentNormalY += colorInfo.bentNormalY * colorInfo.unoccludedRays;
                                 validAoSamplesForBentNormal += colorInfo.unoccludedRays;
                             }
                         }
@@ -215,21 +279,23 @@ namespace RTCK.NeuraBake.Runtime
                         {
                             if (validAoSamplesForBentNormal > 0)
                             {
-                                finalPixelColor.a = Mathf.Clamp01(0.5f + (accumulatedBentNormalY / validAoSamplesForBentNormal) * 0.5f); // -1..1 to 0..1 range
+                                finalPixelColor.a = Mathf.Clamp01(0.5f + (accumulatedBentNormalY / validAoSamplesForBentNormal) * 0.5f);
                             }
-                            else if (settings.useAmbientOcclusion && settings.aoSampleCount > 0) // AO‚µ‚½‚ª‘S•ÂÇ
+                            else if (settings.useAmbientOcclusion && settings.aoSampleCount > 0)
                             {
-                                finalPixelColor.a = 0f; //Š®‘S‚É‰ºŒü‚«i’n–Ê‚È‚Çj‚Ì‹ß—
+                                finalPixelColor.a = 0f;
                             }
-                            else // AO‚È‚µA‚Ü‚½‚ÍƒTƒ“ƒvƒ‹0
+                            else
                             {
-                                finalPixelColor.a = 0.5f; //•ûŒü«î•ñ‚È‚µ (ƒjƒ…[ƒgƒ‰ƒ‹)
+                                finalPixelColor.a = 0.5f;
                             }
                         }
                         else
                         {
-                            finalPixelColor.a = 1.0f; // ƒAƒ‹ƒtƒ@g‚í‚È‚¢ê‡‚Í1
+                            finalPixelColor.a = 1.0f;
                         }
+
+                        // ƒKƒ“ƒ}•â³‚ªCalculatePixelColor‚Ì’†‚Å“K—p‚³‚ê‚Ä‚¢‚é‚Ì‚ÅA‚±‚±‚Å‚Í’Ç‰Á‚Ìˆ—‚Í•s—v
                         pixels[y * textureWidth + x] = finalPixelColor;
                     }
                     else
@@ -252,7 +318,6 @@ namespace RTCK.NeuraBake.Runtime
             return lightmapTexture;
         }
 
-        // FindTriangleAndBarycentricCoords, CalculateBarycentricCoords, InterpolateVector3/2 ‚Í‘O‰ñ‚©‚ç•ÏX‚È‚µ
         private bool FindTriangleAndBarycentricCoords(MeshDataCache meshData, Vector2 uv, out int triangleStartVertexIndex, out Vector3 barycentricCoords)
         {
             triangleStartVertexIndex = 0;
@@ -272,6 +337,7 @@ namespace RTCK.NeuraBake.Runtime
             }
             return false;
         }
+
         private Vector3 CalculateBarycentricCoords(Vector2 p, Vector2 a, Vector2 b, Vector2 c)
         {
             Vector2 v0 = b - a, v1 = c - a, v2 = p - a;
@@ -282,46 +348,46 @@ namespace RTCK.NeuraBake.Runtime
             float d21 = Vector2.Dot(v2, v1);
             float denom = d00 * d11 - d01 * d01;
             if (Mathf.Abs(denom) < 1e-6f) return new Vector3(-1, -1, -1);
-            float v_ = (d11 * d20 - d01 * d21) / denom; // Renamed v to v_
-            float w_ = (d00 * d21 - d01 * d20) / denom; // Renamed w to w_
-            float u_ = 1.0f - v_ - w_;                 // Renamed u to u_
+            float v_ = (d11 * d20 - d01 * d21) / denom;
+            float w_ = (d00 * d21 - d01 * d20) / denom;
+            float u_ = 1.0f - v_ - w_;
             return new Vector3(u_, v_, w_);
         }
+
         private Vector3 InterpolateVector3(Vector3 v0, Vector3 v1, Vector3 v2, Vector3 barycentric)
-        { return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z; }
+        {
+            return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z;
+        }
+
         private Vector2 InterpolateVector2(Vector2 v0, Vector2 v1, Vector2 v2, Vector3 barycentric)
-        { return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z; }
+        {
+            return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z;
+        }
 
-
-        /// <summary>
-        /// ƒsƒNƒZƒ‹‚ÌF‚Æƒxƒ“ƒgƒm[ƒ}ƒ‹Y¬•ª‚ğŒvZ‚µ‚Ü‚·B
-        /// </summary>
-        /// <returns> (ŒvZ‚³‚ê‚½F, ƒxƒ“ƒgƒm[ƒ}ƒ‹Y¬•ª (-1 to 1), AO‚ÅÕ•Á‚³‚ê‚È‚©‚Á‚½ƒŒƒC‚Ì”) </returns>
         private (Color color, float bentNormalY, int unoccludedRays) CalculatePixelColor(
             Vector3 worldPos, Vector3 worldNormal, Material material,
-            Vector2 lightmapUV, // ƒ‰ƒCƒgƒ}ƒbƒvƒeƒNƒZƒ‹‚É‘Î‰‚·‚éUV (ƒ}ƒeƒŠƒAƒ‹ƒTƒ“ƒvƒŠƒ“ƒO‚Æ‚Í•Ê‚Ìê‡‚ ‚è)
-            Vector2 materialSampleUV // ƒ}ƒeƒŠƒAƒ‹ƒvƒƒpƒeƒBƒTƒ“ƒvƒŠƒ“ƒO—pUV (ƒWƒbƒ^ƒŠƒ“ƒO‚³‚ê‚Ä‚¢‚é‰Â”\«‚ ‚è)
-            )
+            Vector2 lightmapUV,
+            Vector2 materialSampleUV)
         {
             MaterialProperties matProps = GetMaterialProperties(material);
-            Color albedo = matProps.GetSampledBaseColor(materialSampleUV); // ƒWƒbƒ^ƒŠƒ“ƒO‚³‚ê‚½UV‚Åƒ}ƒeƒŠƒAƒ‹‚ğƒTƒ“ƒvƒŠƒ“ƒO
+            Color albedo = matProps.GetSampledBaseColor(materialSampleUV);
             var (metallic, roughness) = matProps.GetSampledMetallicRoughness(materialSampleUV);
 
             Color finalColor = Color.black;
 
-            // 1. ƒXƒJƒCƒ‰ƒCƒgŒvZ
             Color skyContribution = CalculateSkyLight(worldPos, worldNormal, albedo);
             finalColor += skyContribution;
 
-            // 2. ’¼ÚŒõ (“_AƒXƒ|ƒbƒgAƒfƒBƒŒƒNƒVƒ‡ƒiƒ‹)
             foreach (Light light in sceneLights)
             {
-                // (CalculatePBRDirectLightŒÄ‚Ño‚µ•”•ª‚Í•ÏX‚È‚µAƒVƒƒƒhƒEŒvZ‚ğC³)
                 Vector3 lightDir;
                 Color lightColorAtPoint = light.color * light.intensity;
                 float attenuation = 1.0f;
 
-                if (light.type == LightType.Directional) { /* ... */ lightDir = -light.transform.forward; }
+                if (light.type == LightType.Directional)
+                {
+                    lightDir = -light.transform.forward;
+                }
                 else
                 {
                     Vector3 lightToPointVec = worldPos - light.transform.position;
@@ -342,26 +408,22 @@ namespace RTCK.NeuraBake.Runtime
                     }
                 }
 
-                // ƒ\ƒtƒgƒVƒƒƒhƒEŒvZ
                 float shadowAccumulator = 0f;
-                int actualShadowSamples = Mathf.Max(1, settings.shadowSamples); // Å’á1ƒTƒ“ƒvƒ‹
+                int actualShadowSamples = Mathf.Max(1, settings.shadowSamples);
                 for (int i = 0; i < actualShadowSamples; i++)
                 {
                     Vector3 jitteredLightDir = lightDir;
-                    Vector3 shadowRayOrigin = worldPos + worldNormal * 0.001f; // ©ŒÈÕ•Á‰ñ”ğ
+                    Vector3 shadowRayOrigin = worldPos + worldNormal * 0.001f;
 
                     if (actualShadowSamples > 1)
                     {
-                        // ƒ‰ƒCƒg‚Ìí—Ş‚ÆŒ`ó‚É‰‚¶‚ÄƒWƒbƒ^ƒŠƒ“ƒO•û–@‚ğ•Ï‚¦‚é‚Ì‚ª—‘z
-                        // ‚±‚±‚Å‚ÍŠÈˆÕ“I‚ÉƒŒƒC‚Ì•ûŒü‚ğ‚í‚¸‚©‚Éƒ‰ƒ“ƒ_ƒ€‰»
-                        // (ŒõŒ¹ƒTƒCƒY‚ª‚È‚¢‚½‚ßA•¨—“I‚Èƒ\ƒtƒgƒVƒƒƒhƒE‚Æ‚ÍˆÙ‚È‚é‹ß—)
-                        Vector3 randomOffset = Random.onUnitSphere * 0.05f; // ƒWƒbƒ^[‚Ì‹­‚³i—v’²®j
+                        Vector3 randomOffset = UnityEngine.Random.onUnitSphere * 0.05f;
                         jitteredLightDir = (lightDir + randomOffset).normalized;
                     }
 
-                    Ray shadowRay = new Ray(shadowRayOrigin, -jitteredLightDir); // ŒõŒ¹•ûŒü‚Ö
+                    Ray shadowRay = new Ray(shadowRayOrigin, -jitteredLightDir);
                     float maxShadowDist = (light.type == LightType.Directional) ? 2000f : Vector3.Distance(worldPos, light.transform.position);
-                    if (!Physics.Raycast(shadowRay, maxShadowDist - 0.002f)) // ƒqƒbƒg‚µ‚È‚¯‚ê‚ÎŒõ‚ª“Í‚­
+                    if (!Physics.Raycast(shadowRay, maxShadowDist - 0.002f))
                     {
                         shadowAccumulator += 1.0f;
                     }
@@ -370,9 +432,9 @@ namespace RTCK.NeuraBake.Runtime
 
                 if (shadowFactor > 0)
                 {
-                    Vector3 viewDir = worldNormal; // ƒ‰ƒCƒgƒ}ƒbƒsƒ“ƒO‚Å‚Í–@ü‚ğ‹ü‚Æ‚·‚é‚±‚Æ‚ª‘½‚¢
+                    Vector3 viewDir = worldNormal;
                     Color directLight = CalculatePBRDirectLight(
-                        lightDir, viewDir, worldNormal, // ƒIƒŠƒWƒiƒ‹‚ÌlightDir‚ğg—p
+                        lightDir, viewDir, worldNormal,
                         lightColorAtPoint * attenuation * shadowFactor,
                         albedo, metallic, roughness
                     );
@@ -380,23 +442,18 @@ namespace RTCK.NeuraBake.Runtime
                 }
             }
 
-            // 3. ”­Œõ–Ê‚©‚ç‚ÌŠñ—^
             foreach (NeuraBakeEmissiveSurface emissiveSurface in emissiveSurfaces)
             {
-                // ”­Œõ–Ê‚©‚ç‚Ìƒ‰ƒCƒeƒBƒ“ƒO‚ğŒvZ (ŠÈˆÕ“I‚È‘½‚­‚ÌVPL‚Æ‚µ‚Äˆµ‚¤)
-                // TODO: ”­Œõ–Êã‚Ì“_‚ğƒTƒ“ƒvƒŠƒ“ƒO‚µAŠe“_‚©‚ç‚ÌŠñ—^‚ğÏZ
-                // MeshFilter‚ÆRenderer‚ğæ“¾
                 MeshFilter emissiveMeshFilter = emissiveSurface.GetComponent<MeshFilter>();
                 Renderer emissiveRenderer = emissiveSurface.GetComponent<Renderer>();
                 if (emissiveMeshFilter == null || emissiveMeshFilter.sharedMesh == null || emissiveRenderer == null) continue;
 
                 Mesh emissiveMesh = emissiveMeshFilter.sharedMesh;
-                int emissiveSamplePoints = 16; // 1”­Œõ–Ê‚ ‚½‚è‚ÌƒTƒ“ƒvƒ‹“_ (İ’è‰Â”\‚É‚µ‚Ä‚à—Ç‚¢)
+                int emissiveSamplePoints = 16;
 
                 for (int i = 0; i < emissiveSamplePoints; i++)
                 {
-                    // ƒƒbƒVƒ…•\–Ê‚Ìƒ‰ƒ“ƒ_ƒ€‚È“_‚ğæ“¾ (–ÊÏ‹Ï“™ƒTƒ“ƒvƒŠƒ“ƒO‚ª—‘z)
-                    int randomTriangleIndex = Random.Range(0, emissiveMesh.triangles.Length / 3);
+                    int randomTriangleIndex = UnityEngine.Random.Range(0, emissiveMesh.triangles.Length / 3);
                     Vector3 b = GetRandomBarycentricCoords();
 
                     int vIdx0 = emissiveMesh.triangles[randomTriangleIndex * 3 + 0];
@@ -414,22 +471,18 @@ namespace RTCK.NeuraBake.Runtime
                     float distToEmissive = Mathf.Sqrt(distToEmissiveSqr);
                     Vector3 normalizedDirToEmissive = dirToEmissive / distToEmissive;
 
-                    // ”­Œõ–Ê‚ª‚±‚¿‚ç‚ğŒü‚¢‚Ä‚¢‚é‚©A‚©‚ÂóŒõ–Ê‚à”­Œõ–Ê‚ğŒü‚¢‚Ä‚¢‚é‚©
                     float NdotL_emissive = Mathf.Max(0, Vector3.Dot(worldNormal, normalizedDirToEmissive));
-                    float NdotL_source = Mathf.Max(0, Vector3.Dot(emissiveNormalWorld, -normalizedDirToEmissive)); // ”­Œõ–Ê–@ü‚ÆŒõŒ¹‚Ö‚Ì‹tƒxƒNƒgƒ‹
+                    float NdotL_source = Mathf.Max(0, Vector3.Dot(emissiveNormalWorld, -normalizedDirToEmissive));
 
                     if (NdotL_emissive > 0 && NdotL_source > 0)
                     {
-                        // ‰Â‹«ƒ`ƒFƒbƒN
                         Ray visibilityRay = new Ray(worldPos + worldNormal * 0.001f, normalizedDirToEmissive);
                         if (!Physics.Raycast(visibilityRay, distToEmissive - 0.002f))
                         {
                             Color emissiveLightColor = emissiveSurface.emissiveColor * emissiveSurface.intensity * settings.emissiveBoost;
-                            // Œ¸Š (1/dist^2) ‚ÆƒtƒH[ƒ€ƒtƒ@ƒNƒ^‹ß— (NdotL_emissive * NdotL_source / dist^2)
-                            float formFactorApprox = (NdotL_emissive * NdotL_source) / (Mathf.PI * distToEmissiveSqr + 1e-4f); // PI‚Í–ÊÏ‚Ìl—¶
-                            formFactorApprox /= emissiveSamplePoints; // ƒTƒ“ƒvƒ‹”‚ÅŠ„‚é
+                            float formFactorApprox = (NdotL_emissive * NdotL_source) / (Mathf.PI * distToEmissiveSqr + 1e-4f);
+                            formFactorApprox /= emissiveSamplePoints;
 
-                            // Diffuse BRDF‚ÅóŒõ
                             Color contribution = (albedo / Mathf.PI) * emissiveLightColor * formFactorApprox;
                             finalColor += contribution;
                         }
@@ -437,7 +490,6 @@ namespace RTCK.NeuraBake.Runtime
                 }
             }
 
-            // 4. AO ‚Æ ƒxƒ“ƒgƒm[ƒ}ƒ‹ŒvZ
             float occlusionFactor = 0f;
             float bentNormalYComponent = 0f;
             int unoccludedRayCount = 0;
@@ -447,55 +499,59 @@ namespace RTCK.NeuraBake.Runtime
                 (occlusionFactor, bentNormalYComponent, unoccludedRayCount) = CalculateAmbientOcclusionAndBentNormal(worldPos, worldNormal, settings.aoSampleCount);
                 finalColor *= (1f - occlusionFactor);
             }
-            else if (settings.directional) // AO–³Œø‚Å‚àƒxƒ“ƒgƒm[ƒ}ƒ‹‚ª•K—v‚Èê‡ (‹ó‚Ì•ûŒü)
+            else if (settings.directional)
             {
-                bentNormalYComponent = worldNormal.y; // ’Pƒ‚É–@ü‚ÌY¬•ª
-                unoccludedRayCount = 1; // ƒ_ƒ~[ƒJƒEƒ“ƒg
+                bentNormalYComponent = worldNormal.y;
+                unoccludedRayCount = 1;
             }
 
+            // ƒJƒ‰[ƒXƒy[ƒX•â³‚ğ“K—p
+            finalColor = ApplyColorSpaceCorrection(finalColor);
 
             return (finalColor, bentNormalYComponent, unoccludedRayCount);
         }
 
         private Vector3 GetRandomBarycentricCoords()
         {
-            float r1 = Random.value;
-            float r2 = Random.value;
+            float r1 = UnityEngine.Random.value;
+            float r2 = UnityEngine.Random.value;
             float sqrtR1 = Mathf.Sqrt(r1);
             return new Vector3(1.0f - sqrtR1, sqrtR1 * (1.0f - r2), sqrtR1 * r2);
         }
 
-
         private Color CalculateSkyLight(Vector3 worldPos, Vector3 worldNormal, Color albedo)
         {
+            Color skyColor;
+            
             if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Skybox && RenderSettings.skybox != null)
             {
-                // Skyboxƒ}ƒeƒŠƒAƒ‹‚©‚ç‚ÌƒTƒ“ƒvƒŠƒ“ƒO‚Í•¡G‚È‚Ì‚ÅA‚±‚±‚Å‚Í‹ß—‚É—¯‚ß‚é
-                // SphericalHarmonicsL2 shEnv = RenderSettings.ambientProbe; // ‚±‚ê‚ğ’¼Úg‚¤‚Ì‚Í“ï‚µ‚¢
-                // Cubemap skyCubemap = RenderSettings.customReflection as Cubemap; // ‚±‚ê‚à‚È‚¢ê‡‚ª‚ ‚é
-                // Å‚à’Pƒ‚É‚Í ambientSkyColor ‚ğg‚¤‚ªA‚æ‚è—Ç‚­‚·‚é‚É‚Í–@ü‚É‰‚¶‚Äƒgƒ‰ƒCƒ‰ƒCƒg‚ğƒuƒŒƒ“ƒh
+                // ƒXƒJƒCƒ{ƒbƒNƒX‚©‚ç‚ÌŠÂ‹«Œõ‚Ì‹ß—
+                skyColor = RenderSettings.ambientSkyColor;
+                // ÀÛ‚ÌƒXƒJƒCƒ{ƒbƒNƒXƒTƒ“ƒvƒŠƒ“ƒO‚Í‚±‚±‚Å‚ÍÈ—ª‚µAambientSkyColor‚ğg—p
             }
-
-            Color skyColor = RenderSettings.ambientSkyColor; // ƒfƒtƒHƒ‹ƒg
-            if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Trilight)
+            else if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Trilight)
             {
-                float dotUp = Vector3.Dot(worldNormal, Vector3.up); // 0 (…•½) to 1 (^ã) or -1 (^‰º)
+                float dotUp = Vector3.Dot(worldNormal, Vector3.up);
                 float upLerp = Mathf.Clamp01(dotUp);
                 float downLerp = Mathf.Clamp01(-dotUp);
                 skyColor = Color.Lerp(RenderSettings.ambientEquatorColor, RenderSettings.ambientSkyColor, upLerp);
                 skyColor = Color.Lerp(skyColor, RenderSettings.ambientGroundColor, downLerp);
             }
-            else if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Flat) // Flat ‚à‚µ‚­‚Í Skybox ‚ÅÚ×î•ñ‚È‚µ
+            else if (RenderSettings.ambientMode == UnityEngine.Rendering.AmbientMode.Flat)
             {
-                skyColor = RenderSettings.ambientLight; // Flat‚Ìê‡
+                skyColor = RenderSettings.ambientLight;
             }
-            // Skybox ‚Ìê‡A–{“–‚Í RenderSettings.ambientProbe (SH) ‚ğ•]‰¿‚·‚é‚©A
-            // Skybox Cubemap ‚ğƒTƒ“ƒvƒŠƒ“ƒO‚·‚é‚Ì‚ª–]‚Ü‚µ‚¢B
-            // ‚±‚±‚Å‚Í’Pƒ‰»‚µ‚ÄAŠÂ‹«Œõ‚ğƒAƒ‹ƒxƒh‚Å•Ï’²B
-            return skyColor * albedo * settings.skyIntensity * RenderSettings.ambientIntensity;
+            else
+            {
+                // ‚»‚Ì‘¼‚Ìƒ‚[ƒh‚Å‚ÌƒtƒH[ƒ‹ƒoƒbƒN
+                skyColor = RenderSettings.ambientSkyColor;
+            }
+            
+            // ƒJƒ‰[ƒXƒy[ƒX•â³‚ğ“K—p
+            Color result = skyColor * albedo * settings.skyIntensity * RenderSettings.ambientIntensity;
+            return ApplyColorSpaceCorrection(result);
         }
 
-        // PBR Direct Light ŒvZ (‘O‰ñ‚©‚ç•ÏX‚È‚µ)
         private Color CalculatePBRDirectLight(Vector3 L, Vector3 V, Vector3 N, Color lightColor, Color albedo, float metallic, float roughness)
         {
             L = L.normalized; V = V.normalized; N = N.normalized;
@@ -509,50 +565,69 @@ namespace RTCK.NeuraBake.Runtime
             Color F_Schlick = Fresnel_Schlick(Mathf.Max(0f, Vector3.Dot(H, V)), F0);
             float G_SmithJointGGX = Smith_Visibility_JointGGX(N, V, L, alpha);
             Color specular = (D_GGX * F_Schlick * G_SmithJointGGX) / (4f * NdotL * NdotV + 1e-6f);
-            Color kd = Color.Lerp(Color.one, Color.black, metallic);
+            Color kd = new Color(1f - metallic, 1f - metallic, 1f - metallic, 1f);
             Color diffuse = kd * albedo / Mathf.PI;
             return (diffuse + specular) * lightColor * NdotL;
         }
-        private float GGX_Distribution(Vector3 N, Vector3 H, float alpha) { /* ... */ float NdotH = Mathf.Max(0f, Vector3.Dot(N, H)); float alphaSq = alpha * alpha; float denom = NdotH * NdotH * (alphaSq - 1f) + 1f; return alphaSq / (Mathf.PI * denom * denom); }
-        private Color Fresnel_Schlick(float cosTheta, Color F0) { /* ... */ return F0 + (new Color(1f - F0.r, 1f - F0.g, 1f - F0.b)) * Mathf.Pow(1f - cosTheta, 5f); } // (1-F0)‚ÌŒvZ‚ğC³
-        private float Smith_Visibility_JointGGX(Vector3 N, Vector3 V, Vector3 L, float alpha) { /* ... */ float NdotV = Mathf.Max(0f, Vector3.Dot(N, V)); float NdotL = Mathf.Max(0f, Vector3.Dot(N, L)); float k_direct = (alpha + 2f * Mathf.Sqrt(alpha) + 1f) / 8f; float G_V = NdotV / (NdotV * (1f - k_direct) + k_direct + 1e-5f); float G_L = NdotL / (NdotL * (1f - k_direct) + k_direct + 1e-5f); return G_V * G_L; }
 
+        private float GGX_Distribution(Vector3 N, Vector3 H, float alpha)
+        {
+            float NdotH = Mathf.Max(0f, Vector3.Dot(N, H));
+            float alphaSq = alpha * alpha;
+            float denom = NdotH * NdotH * (alphaSq - 1f) + 1f;
+            return alphaSq / (Mathf.PI * denom * denom);
+        }
 
-        /// <summary>
-        /// AO‚Æƒxƒ“ƒgƒm[ƒ}ƒ‹Y‚ğŒvZ‚µ‚Ü‚·B
-        /// </summary>
-        /// <returns>(occlusionFactor, bentNormal.y, unoccludedRayCount)</returns>
+        private Color Fresnel_Schlick(float cosTheta, Color F0)
+        {
+            return F0 + (new Color(1f - F0.r, 1f - F0.g, 1f - F0.b)) * Mathf.Pow(1f - cosTheta, 5f);
+        }
+
+        private float Smith_Visibility_JointGGX(Vector3 N, Vector3 V, Vector3 L, float alpha)
+        {
+            float NdotV = Mathf.Max(0f, Vector3.Dot(N, V));
+            float NdotL = Mathf.Max(0f, Vector3.Dot(N, L));
+            float k_direct = (alpha + 2f * Mathf.Sqrt(alpha) + 1f) / 8f;
+            float G_V = NdotV / (NdotV * (1f - k_direct) + k_direct + 1e-5f);
+            float G_L = NdotL / (NdotL * (1f - k_direct) + k_direct + 1e-5f);
+            return G_V * G_L;
+        }
+
         private (float occlusion, float bentNormalY, int unoccludedRays) CalculateAmbientOcclusionAndBentNormal(Vector3 position, Vector3 normal, int sampleCount)
         {
-            if (sampleCount <= 0) return (0f, normal.y, 0); // AO‚È‚µ‚È‚ç–@ü‚ÌY‚ğ•Ô‚·
+            if (sampleCount <= 0) return (0f, normal.y, 0);
 
             float occlusionFactor = 0f;
             Vector3 accumulatedUnoccludedNormal = Vector3.zero;
             int unoccludedRayCount = 0;
-            float maxAoDistance = 2.0f; // AO‚Ì—LŒø”¼Œa
+            float maxAoDistance = 2.0f;
 
             for (int i = 0; i < sampleCount; i++)
             {
-                Vector3 randomDir = Random.onUnitSphere;
+                Vector3 randomDir = UnityEngine.Random.onUnitSphere;
                 if (Vector3.Dot(randomDir, normal) < 0)
                 {
                     randomDir = -randomDir;
                 }
 
                 Ray aoRay = new Ray(position + normal * 0.001f, randomDir);
-                if (!Physics.Raycast(aoRay, maxAoDistance)) // ƒqƒbƒg‚µ‚È‚¯‚ê‚ÎÕ•Á‚³‚ê‚Ä‚¢‚È‚¢
+
+                // æœ€é©åŒ–ã•ã‚ŒãŸãƒ¬ã‚¤ã‚­ãƒ£ã‚¹ãƒˆå‡¦ç†ï¼ˆã‚­ãƒ£ãƒƒã‚·ãƒ¥åˆ©ç”¨ï¼‰
+                if (!raycastCache.Raycast(aoRay, maxAoDistance))
+                {
+                    lock (cacheLock)
                 {
                     accumulatedUnoccludedNormal += randomDir;
                     unoccludedRayCount++;
                 }
-                else // ƒqƒbƒg‚µ‚½‚çÕ•Á
+                else
                 {
                     occlusionFactor += 1f;
                 }
             }
 
             float finalOcclusion = (sampleCount > 0) ? occlusionFactor / sampleCount : 0f;
-            float finalBentNormalY = normal.y; // ƒfƒtƒHƒ‹ƒg‚ÍŒ³‚Ì–@üY
+            float finalBentNormalY = normal.y;
 
             if (unoccludedRayCount > 0)
             {
@@ -560,6 +635,33 @@ namespace RTCK.NeuraBake.Runtime
             }
 
             return (finalOcclusion, finalBentNormalY, unoccludedRayCount);
+        }
+
+        private static bool IsMaskMap(Material material, Texture2D texture)
+        {
+            if (texture == null) return false;
+
+            bool isHDRP = material.shader.name.Contains("HDRP") ||
+                          material.shader.name.Contains("High Definition");
+            bool isURP = material.shader.name.Contains("URP") ||
+                         material.shader.name.Contains("Universal");
+
+            bool hasMaskMapProperty = material.HasProperty("_MaskMap");
+
+            return isHDRP || hasMaskMapProperty ||
+                   (texture.name.Contains("_MaskMap") && isURP);
+        }
+
+        private Color ApplyColorSpaceCorrection(Color color)
+        {
+            if (QualitySettings.activeColorSpace == ColorSpace.Gamma)
+                return new Color(
+                    Mathf.LinearToGammaSpace(color.r),
+                    Mathf.LinearToGammaSpace(color.g),
+                    Mathf.LinearToGammaSpace(color.b),
+                    color.a
+                );
+            return color;
         }
     }
 }

@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Unity.Burst;
@@ -16,7 +17,7 @@ namespace RTCK.NeuraBake.Runtime
 {
     public class BakingCore : ILightmapRenderer
     {
-        // RenderTexture ‚©‚ç Texture2D ‚Ö•ÏŠ·‚·‚éƒƒ\ƒbƒh
+        // RenderTexture ï¿½ï¿½ï¿½ï¿½ Texture2D ï¿½Ö•ÏŠï¿½ï¿½ï¿½ï¿½éƒï¿½\ï¿½bï¿½h
         public static Texture2D ConvertRenderTextureToTexture2D(RenderTexture rt)
         {
             if (rt == null)
@@ -45,7 +46,7 @@ namespace RTCK.NeuraBake.Runtime
             }
         }
 
-        // Texture2D ‚ğ PNG ƒtƒ@ƒCƒ‹‚Æ‚µ‚Ä•Û‘¶‚·‚éƒƒ\ƒbƒh
+        // Texture2D ï¿½ï¿½ PNG ï¿½tï¿½@ï¿½Cï¿½ï¿½ï¿½Æ‚ï¿½ï¿½Ä•Û‘ï¿½ï¿½ï¿½ï¿½éƒï¿½\ï¿½bï¿½h
         public static bool SaveTexture2DToPNG(Texture2D tex, string path)
         {
             if (tex == null)
@@ -71,14 +72,23 @@ namespace RTCK.NeuraBake.Runtime
                 Debug.LogError($"Error saving PNG file: {e.Message}");
                 return false;
             }
-        }
-
-        private readonly NeuraBakeSettings settings;
+        }        private readonly NeuraBakeSettings settings;
         private readonly Light[] sceneLights;
         private readonly NeuraBakeEmissiveSurface[] emissiveSurfaces;
-        private readonly Dictionary<Material, MaterialProperties> materialCache = new Dictionary<Material, MaterialProperties>();
-        private readonly Dictionary<Mesh, MeshDataCache> meshDataCache = new Dictionary<Mesh, MeshDataCache>();
-        private readonly object cacheLock = new object();
+        private readonly ConcurrentDictionary<Material, MaterialProperties> materialCache = new ConcurrentDictionary<Material, MaterialProperties>();
+        private readonly ConcurrentDictionary<Mesh, MeshDataCache> meshDataCache = new ConcurrentDictionary<Mesh, MeshDataCache>();
+
+        // Cached property IDs for performance
+        private static readonly int BaseColorPropertyId = Shader.PropertyToID("_BaseColor");
+        private static readonly int ColorPropertyId = Shader.PropertyToID("_Color");
+        private static readonly int MetallicPropertyId = Shader.PropertyToID("_Metallic");
+        private static readonly int GlossinessPropertyId = Shader.PropertyToID("_Glossiness");
+        private static readonly int SmoothnessPropertyId = Shader.PropertyToID("_Smoothness");
+        private static readonly int MainTexPropertyId = Shader.PropertyToID("_MainTex");
+        private static readonly int MetallicGlossMapPropertyId = Shader.PropertyToID("_MetallicGlossMap");
+        private static readonly int BumpMapPropertyId = Shader.PropertyToID("_BumpMap");
+        private static readonly int MainTexSTPropertyId = Shader.PropertyToID("_MainTex_ST");
+        private static readonly int MaskMapPropertyId = Shader.PropertyToID("_MaskMap");
 
         private class SpatialCache
         {
@@ -121,13 +131,13 @@ namespace RTCK.NeuraBake.Runtime
                 }
             }
             
-            // ƒƒCƒ“ƒXƒŒƒbƒh‚Å‚Ì‚İg—p‚·‚éƒLƒƒƒbƒVƒ…
+            // ï¿½ï¿½ï¿½Cï¿½ï¿½ï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½Å‚Ì‚İgï¿½pï¿½ï¿½ï¿½ï¿½Lï¿½ï¿½ï¿½bï¿½Vï¿½ï¿½
             private readonly ConcurrentDictionary<RaycastKey, bool> cache = new ConcurrentDictionary<RaycastKey, bool>();
             
-            // –‘OŒvZ‚³‚ê‚½Œ‹‰ÊiƒXƒŒƒbƒhƒZ[ƒtj
+            // ï¿½ï¿½ï¿½Oï¿½vï¿½Zï¿½ï¿½ï¿½ê‚½ï¿½ï¿½ï¿½Êiï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½Zï¿½[ï¿½tï¿½j
             private readonly ConcurrentDictionary<RaycastKey, bool> precalculatedResults = new ConcurrentDictionary<RaycastKey, bool>();
             
-            // ƒƒCƒ“ƒXƒŒƒbƒh‚Å‚Ì‚İŒÄ‚Ño‚µ‰Â”\
+            // ï¿½ï¿½ï¿½Cï¿½ï¿½ï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½Å‚Ì‚İŒÄ‚Ñoï¿½ï¿½ï¿½Â”\
             public void PrecalculateRaycast(Vector3 origin, Vector3 direction, float maxDistance)
             {
                 var key = new RaycastKey(origin, direction, maxDistance);
@@ -135,18 +145,18 @@ namespace RTCK.NeuraBake.Runtime
                 precalculatedResults.TryAdd(key, result);
             }
 
-            // ƒXƒŒƒbƒhƒZ[ƒt‚ÈRaycastƒƒ\ƒbƒhiƒƒCƒ“ƒXƒŒƒbƒh‚Å‚È‚­‚Ä‚àŒÄ‚Ño‚µ‰Â”\j
+            // ï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½Zï¿½[ï¿½tï¿½ï¿½Raycastï¿½ï¿½ï¿½\ï¿½bï¿½hï¿½iï¿½ï¿½ï¿½Cï¿½ï¿½ï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½Å‚È‚ï¿½ï¿½Ä‚ï¿½ï¿½Ä‚Ñoï¿½ï¿½ï¿½Â”\ï¿½j
             public bool Raycast(Ray ray, float maxDistance)
             {
                 var key = new RaycastKey(ray.origin, ray.direction, maxDistance);
                 
-                // –‘OŒvZŒ‹‰Ê‚ª‚ ‚ê‚Î‚»‚ê‚ğ•Ô‚·
+                // ï¿½ï¿½ï¿½Oï¿½vï¿½Zï¿½ï¿½ï¿½Ê‚ï¿½ï¿½ï¿½ï¿½ï¿½Î‚ï¿½ï¿½ï¿½ï¿½Ô‚ï¿½
                 if (precalculatedResults.TryGetValue(key, out bool result))
                 {
                     return result;
                 }
                 
-                // ‹ß—ƒL[‚ğ’T‚·i‹ß‚¢ˆÊ’u‚â•ûŒü‚ÌƒŒƒCƒLƒƒƒXƒgŒ‹‰Ê‚ğÄ—˜—pj
+                // ï¿½ßï¿½ï¿½Lï¿½[ï¿½ï¿½Tï¿½ï¿½ï¿½iï¿½ß‚ï¿½ï¿½Ê’uï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ìƒï¿½ï¿½Cï¿½Lï¿½ï¿½ï¿½Xï¿½gï¿½ï¿½ï¿½Ê‚ï¿½ï¿½Ä—ï¿½ï¿½pï¿½j
                 foreach (var kvp in precalculatedResults)
                 {
                     if (Vector3.Distance(kvp.Key.Origin, key.Origin) < 0.1f &&
@@ -157,15 +167,15 @@ namespace RTCK.NeuraBake.Runtime
                     }
                 }
                 
-                // ƒLƒƒƒbƒVƒ…ƒ~ƒX‚Ìê‡‚ÍƒfƒtƒHƒ‹ƒg’l‚ğ•Ô‚·iáŠQ•¨‚È‚µj
-                // •À—ñˆ—“à‚Å‚ÍPhysics.Raycast‚ğŒÄ‚Ño‚¹‚È‚¢‚½‚ßAˆÀ‘S‚È’l‚ğ•Ô‚·
+                // ï¿½Lï¿½ï¿½ï¿½bï¿½Vï¿½ï¿½ï¿½~ï¿½Xï¿½Ìê‡ï¿½Íƒfï¿½tï¿½Hï¿½ï¿½ï¿½gï¿½lï¿½ï¿½Ô‚ï¿½ï¿½iï¿½ï¿½Qï¿½ï¿½ï¿½È‚ï¿½ï¿½j
+                // ï¿½ï¿½ï¿½ñˆ—ï¿½ï¿½ï¿½ï¿½Å‚ï¿½Physics.Raycastï¿½ï¿½ï¿½Ä‚Ñoï¿½ï¿½ï¿½È‚ï¿½ï¿½ï¿½ï¿½ßAï¿½ï¿½ï¿½Sï¿½È’lï¿½ï¿½Ô‚ï¿½
                 return false;
             }
 
             public void Clear()
             {
                 cache.Clear();
-                // ’ˆÓ: precalculatedResults‚ÍƒNƒŠƒA‚µ‚È‚¢
+                // ï¿½ï¿½ï¿½ï¿½: precalculatedResultsï¿½ÍƒNï¿½ï¿½ï¿½Aï¿½ï¿½ï¿½È‚ï¿½
             }
         }
 
@@ -327,7 +337,7 @@ namespace RTCK.NeuraBake.Runtime
             }
         }
 
-        // ILightmapRendererƒCƒ“ƒ^[ƒtƒF[ƒX‚ÌÀ‘•
+        // ILightmapRendererï¿½Cï¿½ï¿½ï¿½^ï¿½[ï¿½tï¿½Fï¿½[ï¿½Xï¿½Ìï¿½ï¿½ï¿½
         public async Task<Texture2D> RenderAsync(CancellationToken token, IProgress<(float percentage, string message)> progress)
         {
             return await BakeLightmapAsync(token, progress);
@@ -339,7 +349,7 @@ namespace RTCK.NeuraBake.Runtime
                 .Where(r => r.enabled && r.gameObject.isStatic && r.gameObject.activeInHierarchy).ToArray();
             if (renderers.Length == 0)
             {
-                progressReporter?.Report((1f, "ƒxƒCƒN‘ÎÛ‚ÌÃ“IMeshRenderer‚È‚µ"));
+                progressReporter?.Report((1f, "ï¿½xï¿½Cï¿½Nï¿½ÎÛ‚ÌÃ“IMeshRendererï¿½È‚ï¿½"));
                 return null;
             }
 
@@ -348,7 +358,7 @@ namespace RTCK.NeuraBake.Runtime
             MeshFilter meshFilter = targetRenderer.GetComponent<MeshFilter>();
             if (meshFilter?.sharedMesh == null || targetMaterial == null)
             {
-                progressReporter?.Report((1f, "‘ÎÛƒƒbƒVƒ…/ƒ}ƒeƒŠƒAƒ‹‚È‚µ"));
+                progressReporter?.Report((1f, "ï¿½ÎÛƒï¿½ï¿½bï¿½Vï¿½ï¿½/ï¿½}ï¿½eï¿½ï¿½ï¿½Aï¿½ï¿½ï¿½È‚ï¿½"));
                 return null;
             }
 
@@ -356,20 +366,20 @@ namespace RTCK.NeuraBake.Runtime
             MeshDataCache meshData = GetMeshData(mesh);
             if (meshData.UVs == null || meshData.UVs.Length == 0)
             {
-                progressReporter?.Report((1f, "‘ÎÛƒƒbƒVƒ…‚ÉUV‚È‚µ"));
+                progressReporter?.Report((1f, "ï¿½ÎÛƒï¿½ï¿½bï¿½Vï¿½ï¿½ï¿½ï¿½UVï¿½È‚ï¿½"));
                 return null;
             }
 
             int textureWidth = settings.atlasSize;
             int textureHeight = settings.atlasSize;
-            progressReporter?.Report((0.01f, "ƒ‰ƒCƒgƒ}ƒbƒv¶¬ŠJn..."));
+            progressReporter?.Report((0.01f, "ï¿½ï¿½ï¿½Cï¿½gï¿½}ï¿½bï¿½vï¿½ï¿½ï¿½ï¿½ï¿½Jï¿½n..."));
 
             Texture2D lightmapTexture = null;
             Color[] finalPixels = new Color[textureWidth * textureHeight];
 
             try
             {
-                // –‘O‚ÉmainƒXƒŒƒbƒh‚ÅlocalToWorld, world-space’¸“_/–@ü‚ğŒvZ‚µ‚Ä‚¨‚­
+                // ï¿½ï¿½ï¿½Oï¿½ï¿½mainï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½ï¿½localToWorld, world-spaceï¿½ï¿½ï¿½_/ï¿½@ï¿½ï¿½ï¿½ï¿½ï¿½vï¿½Zï¿½ï¿½ï¿½Ä‚ï¿½ï¿½ï¿½
                 Matrix4x4 localToWorld = targetRenderer.transform.localToWorldMatrix;
                 Vector3[] worldVertices = new Vector3[meshData.Vertices.Length];
                 for (int i = 0; i < meshData.Vertices.Length; i++)
@@ -382,7 +392,7 @@ namespace RTCK.NeuraBake.Runtime
                     worldNormals[i] = localToWorld.MultiplyVector(meshData.Normals[i]).normalized;
                 }
 
-                // –‘O‚ÉmainƒXƒŒƒbƒh‚ÅRandom’l‚ğ¶¬‚µ‚Ä‚¨‚­
+                // ï¿½ï¿½ï¿½Oï¿½ï¿½mainï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½ï¿½Randomï¿½lï¿½ğ¶ï¿½ï¿½ï¿½ï¿½Ä‚ï¿½ï¿½ï¿½
                 Vector2[][] randomOffsetsPerPixel = null;
                 if (settings.sampleCount > 1)
                 {
@@ -398,9 +408,9 @@ namespace RTCK.NeuraBake.Runtime
                     }
                 }
                 
-                // emissiveƒT[ƒtƒFƒX‚ÌƒTƒ“ƒvƒŠƒ“ƒO‚Ì‚½‚ß‚Ì—”’l‚ğ–‘O¶¬
+                // emissiveï¿½Tï¿½[ï¿½tï¿½Fï¿½Xï¿½ÌƒTï¿½ï¿½ï¿½vï¿½ï¿½ï¿½ï¿½ï¿½Oï¿½Ì‚ï¿½ï¿½ß‚Ì—ï¿½ï¿½ï¿½ï¿½lï¿½ï¿½ï¿½ï¿½ï¿½Oï¿½ï¿½ï¿½ï¿½
                 Vector3[] precomputedBarycentricCoords = new Vector3[1000];
-                for (int i = 0; i < 1000; i++) // \•ª‚È”‚Ì–‘OŒvZ‚ğ—pˆÓ
+                for (int i = 0; i < 1000; i++) // ï¿½\ï¿½ï¿½ï¿½Èï¿½ï¿½Ìï¿½ï¿½Oï¿½vï¿½Zï¿½ï¿½pï¿½ï¿½
                 {
                     float r1 = Random.value; 
                     float r2 = Random.value; 
@@ -408,10 +418,10 @@ namespace RTCK.NeuraBake.Runtime
                     precomputedBarycentricCoords[i] = new Vector3(1.0f - sqrtR1, sqrtR1 * (1.0f - r2), sqrtR1 * r2);
                 }
 
-                // MaterialProperties ‚ğƒLƒƒƒbƒVƒ…
+                // MaterialProperties ï¿½ï¿½ï¿½Lï¿½ï¿½ï¿½bï¿½Vï¿½ï¿½
                 MaterialProperties cachedMaterialProps = GetMaterialProperties(targetMaterial);
 
-                // ƒAƒ“ƒrƒGƒ“ƒgî•ñ‚ğƒLƒƒƒbƒVƒ…
+                // ï¿½Aï¿½ï¿½ï¿½rï¿½Gï¿½ï¿½ï¿½gï¿½ï¿½ï¿½ï¿½ï¿½Lï¿½ï¿½ï¿½bï¿½Vï¿½ï¿½
                 var ambientInfo = new CachedAmbientInfo
                 {
                     mode = RenderSettings.ambientMode,
@@ -423,7 +433,7 @@ namespace RTCK.NeuraBake.Runtime
                     ambientIntensity = RenderSettings.ambientIntensity
                 };
 
-                // Lightî•ñ‚ğƒLƒƒƒbƒVƒ…
+                // Lightï¿½ï¿½ï¿½ï¿½ï¿½Lï¿½ï¿½ï¿½bï¿½Vï¿½ï¿½
                 var cachedLights = sceneLights.Select(l => new CachedLightInfo
                 {
                     type = l.type,
@@ -435,7 +445,7 @@ namespace RTCK.NeuraBake.Runtime
                     spotAngle = l.spotAngle
                 }).ToArray();
 
-                // ƒVƒƒƒhƒEƒTƒ“ƒvƒ‹•ûŒü‚ğ–‘OŒvZ
+                // ï¿½Vï¿½ï¿½ï¿½hï¿½Eï¿½Tï¿½ï¿½ï¿½vï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Oï¿½vï¿½Z
                 Dictionary<int, Vector3[]> shadowJitterDirections = new Dictionary<int, Vector3[]>();
                 for (int samples = 1; samples <= settings.shadowSamples; samples++)
                 {
@@ -448,14 +458,14 @@ namespace RTCK.NeuraBake.Runtime
                     shadowJitterDirections[samples] = directions;
                 }
 
-                // ƒƒCƒ“ƒXƒŒƒbƒh‚ÅƒŒƒCƒLƒƒƒXƒg‚ğ–‘OŒvZ
-                progressReporter?.Report((0.1f, "ƒŒƒCƒLƒƒƒXƒg–‘OŒvZ’†..."));
+                // ï¿½ï¿½ï¿½Cï¿½ï¿½ï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½Åƒï¿½ï¿½Cï¿½Lï¿½ï¿½ï¿½Xï¿½gï¿½ï¿½ï¿½ï¿½ï¿½Oï¿½vï¿½Z
+                progressReporter?.Report((0.1f, "ï¿½ï¿½ï¿½Cï¿½Lï¿½ï¿½ï¿½Xï¿½gï¿½ï¿½ï¿½Oï¿½vï¿½Zï¿½ï¿½..."));
 
-                // ‚æ‚è‘½‚­‚ÌƒTƒ“ƒvƒŠƒ“ƒOƒ|ƒCƒ“ƒg‚ğ¶¬iƒƒbƒVƒ…‚©‚ç’¼ÚƒTƒ“ƒvƒŠƒ“ƒOj
+                // ï¿½ï¿½è‘½ï¿½ï¿½ï¿½ÌƒTï¿½ï¿½ï¿½vï¿½ï¿½ï¿½ï¿½ï¿½Oï¿½|ï¿½Cï¿½ï¿½ï¿½gï¿½ğ¶ï¿½ï¿½iï¿½ï¿½ï¿½bï¿½Vï¿½ï¿½ï¿½ï¿½ï¿½ç’¼ï¿½ÚƒTï¿½ï¿½ï¿½vï¿½ï¿½ï¿½ï¿½ï¿½Oï¿½j
                 HashSet<Vector3> samplePositions = new HashSet<Vector3>();
-                int positionSamplesPerTriangle = 2; // ŠeOŠpŒ`‚©‚çNŒÂ‚ÌˆÊ’u‚ğƒTƒ“ƒvƒ‹
+                int positionSamplesPerTriangle = 2; // ï¿½eï¿½Oï¿½pï¿½`ï¿½ï¿½ï¿½ï¿½Nï¿½Â‚ÌˆÊ’uï¿½ï¿½ï¿½Tï¿½ï¿½ï¿½vï¿½ï¿½
 
-                // ƒƒbƒVƒ…ã‚ÌˆÊ’u‚©‚çƒTƒ“ƒvƒŠƒ“ƒO
+                // ï¿½ï¿½ï¿½bï¿½Vï¿½ï¿½ï¿½ï¿½ÌˆÊ’uï¿½ï¿½ï¿½ï¿½Tï¿½ï¿½ï¿½vï¿½ï¿½ï¿½ï¿½ï¿½O
                 for (int i = 0; i < meshData.Triangles.Length / 3; i += 3)
                 {
                     int v0 = meshData.Triangles[i];
@@ -468,14 +478,14 @@ namespace RTCK.NeuraBake.Runtime
                     
                     for (int j = 0; j < positionSamplesPerTriangle; j++)
                     {
-                        // OŠpŒ`ã‚Ìƒ‰ƒ“ƒ_ƒ€‚È“_‚ğæ“¾
+                        // ï¿½Oï¿½pï¿½`ï¿½ï¿½Ìƒï¿½ï¿½ï¿½ï¿½_ï¿½ï¿½ï¿½È“_ï¿½ï¿½ï¿½æ“¾
                         Vector3 bary = new Vector3(
                             UnityEngine.Random.value,
                             UnityEngine.Random.value,
                             UnityEngine.Random.value
                         );
                         
-                        // ³‹K‰»
+                        // ï¿½ï¿½ï¿½Kï¿½ï¿½
                         float sum = bary.x + bary.y + bary.z;
                         if (sum > 0)
                             bary /= sum;
@@ -485,7 +495,7 @@ namespace RTCK.NeuraBake.Runtime
                     }
                 }
 
-                // ƒV[ƒ““à‚Ìƒ‰ƒ“ƒ_ƒ€‚ÈˆÊ’u‚à’Ç‰Á
+                // ï¿½Vï¿½[ï¿½ï¿½ï¿½ï¿½ï¿½Ìƒï¿½ï¿½ï¿½ï¿½_ï¿½ï¿½ï¿½ÈˆÊ’uï¿½ï¿½ï¿½Ç‰ï¿½
                 for (int i = 0; i < 100; i++)
                 {
                     Vector3 randomPos = new Vector3(
@@ -496,7 +506,7 @@ namespace RTCK.NeuraBake.Runtime
                     samplePositions.Add(randomPos);
                 }
 
-                // ‚·‚×‚Ä‚ÌŒõŒ¹‚ÆƒTƒ“ƒvƒŠƒ“ƒOˆÊ’u‚Ì‘g‚İ‡‚í‚¹‚ÅƒŒƒCƒLƒƒƒXƒgŒ‹‰Ê‚ğ–‘OŒvZ
+                // ï¿½ï¿½ï¿½×‚Ä‚ÌŒï¿½ï¿½ï¿½ï¿½ÆƒTï¿½ï¿½ï¿½vï¿½ï¿½ï¿½ï¿½ï¿½Oï¿½Ê’uï¿½Ì‘gï¿½İï¿½ï¿½í‚¹ï¿½Åƒï¿½ï¿½Cï¿½Lï¿½ï¿½ï¿½Xï¿½gï¿½ï¿½ï¿½Ê‚ï¿½ï¿½ï¿½ï¿½Oï¿½vï¿½Z
                 int processedRays = 0;
                 int totalRays = samplePositions.Count * shadowJitterDirections[settings.shadowSamples].Length * cachedLights.Length;
                     
@@ -513,14 +523,14 @@ namespace RTCK.NeuraBake.Runtime
                             {
                                 Vector3 dirOffset = jitterArr[d];
                                 Vector3 jitteredDir = (lightDirection + dirOffset).normalized;
-                                Vector3 normal = Vector3.up; // ’Pƒ‰»‚Ì‚½‚ß
+                                Vector3 normal = Vector3.up; // ï¿½Pï¿½ï¿½ï¿½ï¿½ï¿½Ì‚ï¿½ï¿½ï¿½
                                 Vector3 rayOrigin = samplePos + normal * 0.001f;
                                 mainRaycastCache.PrecalculateRaycast(rayOrigin, -jitteredDir, 2000f);
                                 processedRays++;
                                 if (processedRays % 100 == 0)
                                 {
                                     float progress = 0.1f + 0.2f * (float)processedRays / totalRays;
-                                    progressReporter?.Report((progress, $"ƒŒƒCƒLƒƒƒXƒg–‘OŒvZ’†: {processedRays}/{totalRays}"));
+                                    progressReporter?.Report((progress, $"ï¿½ï¿½ï¿½Cï¿½Lï¿½ï¿½ï¿½Xï¿½gï¿½ï¿½ï¿½Oï¿½vï¿½Zï¿½ï¿½: {processedRays}/{totalRays}"));
                                 }
                             }
                         }
@@ -531,30 +541,30 @@ namespace RTCK.NeuraBake.Runtime
                             if (distSqr <= light.range * light.range)
                             {
                                 Vector3 pointLightDir = -lightToPointVec.normalized;
-                                Vector3 normal = Vector3.up; // ’Pƒ‰»‚Ì‚½‚ß
+                                Vector3 normal = Vector3.up; // ï¿½Pï¿½ï¿½ï¿½ï¿½ï¿½Ì‚ï¿½ï¿½ï¿½
                                 Vector3 rayOrigin = samplePos + normal * 0.001f;
                                 mainRaycastCache.PrecalculateRaycast(rayOrigin, -pointLightDir, lightToPointVec.magnitude);
                                 processedRays++;
                                 if (processedRays % 100 == 0)
                                 {
                                     float progress = 0.1f + 0.2f * (float)processedRays / totalRays;
-                                    progressReporter?.Report((progress, $"ƒŒƒCƒLƒƒƒXƒg–‘OŒvZ’†: {processedRays}/{totalRays}"));
+                                    progressReporter?.Report((progress, $"ï¿½ï¿½ï¿½Cï¿½Lï¿½ï¿½ï¿½Xï¿½gï¿½ï¿½ï¿½Oï¿½vï¿½Zï¿½ï¿½: {processedRays}/{totalRays}"));
                                 }
                             }
                         }
                     }
                 }
 
-                progressReporter?.Report((0.3f, "ƒŒƒCƒLƒƒƒXƒg–‘OŒvZŠ®—¹"));
+                progressReporter?.Report((0.3f, "ï¿½ï¿½ï¿½Cï¿½Lï¿½ï¿½ï¿½Xï¿½gï¿½ï¿½ï¿½Oï¿½vï¿½Zï¿½ï¿½ï¿½ï¿½"));
 
-                // CPU•À—ñˆ—ƒpƒX
-                progressReporter?.Report((0.5f, "CPU•À—ñˆ—’†..."));
+                // CPUï¿½ï¿½ï¿½ñˆ—ï¿½ï¿½pï¿½X
+                progressReporter?.Report((0.5f, "CPUï¿½ï¿½ï¿½ñˆ—ï¿½ï¿½ï¿½..."));
                 int processedPixelCount = 0;
                 int totalValidPixelsToProcess = textureWidth * textureHeight;
                 int reportInterval = Math.Max(1, totalValidPixelsToProcess / 100);
                 var parallelOptions = new ParallelOptions { CancellationToken = token, MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) };
                 
-                // ƒXƒŒƒbƒh“à‚Å‚àƒAƒNƒZƒX‰Â”\‚ÈƒLƒƒƒbƒVƒ…‚ğˆÛ‚·‚é‚½‚ßclear‚µ‚È‚¢
+                // ï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½ï¿½ï¿½Å‚ï¿½ï¿½Aï¿½Nï¿½Zï¿½Xï¿½Â”\ï¿½ÈƒLï¿½ï¿½ï¿½bï¿½Vï¿½ï¿½ï¿½ï¿½ï¿½Ûï¿½ï¿½ï¿½ï¿½é‚½ï¿½ï¿½clearï¿½ï¿½ï¿½È‚ï¿½
                 // mainRaycastCache.Clear();
 
                 await Task.Run(() =>
@@ -590,7 +600,7 @@ namespace RTCK.NeuraBake.Runtime
                                     int v1 = meshData.Triangles[triIdx * 3 + 1]; 
                                     int v2 = meshData.Triangles[triIdx * 3 + 2];
                                     
-                                    // ‚±‚±‚ÅmainƒXƒŒƒbƒh‚ÅŒvZ‚µ‚½world-spaceÀ•W/–@ü‚ğg‚¤
+                                    // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½mainï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½ÅŒvï¿½Zï¿½ï¿½ï¿½ï¿½world-spaceï¿½ï¿½ï¿½W/ï¿½@ï¿½ï¿½ï¿½ï¿½ï¿½gï¿½ï¿½
                                     Vector3 wp = InterpolateVector3(worldVertices[v0], worldVertices[v1], worldVertices[v2], bary);
                                     Vector3 wn = InterpolateVector3(worldNormals[v0], worldNormals[v1], worldNormals[v2], bary).normalized;
                                     Vector2 lmUV = InterpolateVector2(meshData.UVs[v0], meshData.UVs[v1], meshData.UVs[v2], bary);
@@ -643,7 +653,7 @@ namespace RTCK.NeuraBake.Runtime
                                 if (curProc % reportInterval == 0 || curProc == totalValidPixelsToProcess)
                                 {
                                     float prog = 0.5f + (0.5f * curProc / totalValidPixelsToProcess);
-                                    progressReporter?.Report((prog, $"CPU ƒsƒNƒZƒ‹ˆ—’†: {curProc}/{totalValidPixelsToProcess}"));
+                                    progressReporter?.Report((prog, $"CPU ï¿½sï¿½Nï¿½Zï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½: {curProc}/{totalValidPixelsToProcess}"));
                                 }
                             }
                         }
@@ -653,40 +663,40 @@ namespace RTCK.NeuraBake.Runtime
                 if (token.IsCancellationRequested) 
                     throw new OperationCanceledException();
 
-                DilationEdgePadding(finalPixels, textureWidth, textureHeight, 8); // ƒGƒbƒWƒpƒfƒBƒ“ƒO
+                DilationEdgePadding(finalPixels, textureWidth, textureHeight, 8); // ï¿½Gï¿½bï¿½Wï¿½pï¿½fï¿½Bï¿½ï¿½ï¿½O
 
                 lightmapTexture = new Texture2D(textureWidth, textureHeight, TextureFormat.RGBAHalf, false, true);
                 lightmapTexture.name = $"{targetRenderer.gameObject.name}_Lightmap_Baked_CPU";
                 lightmapTexture.wrapMode = TextureWrapMode.Clamp;
                 lightmapTexture.filterMode = FilterMode.Bilinear;
                 lightmapTexture.SetPixels(finalPixels);
-                lightmapTexture.Apply(true, false); //ƒ~ƒbƒvƒ}ƒbƒv‚Í•s—v‚È‚Ì‚Åfalse, “Ç‚İæ‚è•s‰Â‚É‚Í‚µ‚È‚¢
-                progressReporter?.Report((1f, "CPU•À—ñˆ—Š®—¹"));
+                lightmapTexture.Apply(true, false); //ï¿½~ï¿½bï¿½vï¿½}ï¿½bï¿½vï¿½Í•sï¿½vï¿½È‚Ì‚ï¿½false, ï¿½Ç‚İï¿½ï¿½sï¿½Â‚É‚Í‚ï¿½ï¿½È‚ï¿½
+                progressReporter?.Report((1f, "CPUï¿½ï¿½ï¿½ñˆ—ï¿½ï¿½ï¿½ï¿½ï¿½"));
 
                 if (lightmapTexture == null && !token.IsCancellationRequested)
                 {
-                    progressReporter?.Report((1f, "ƒ‰ƒCƒgƒ}ƒbƒv¶¬¸”s")); 
+                    progressReporter?.Report((1f, "ï¿½ï¿½ï¿½Cï¿½gï¿½}ï¿½bï¿½vï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½s")); 
                     return null;
                 }
 
-                // ƒfƒmƒCƒU[“K—p
+                // ï¿½fï¿½mï¿½Cï¿½Uï¿½[ï¿½Kï¿½p
                 if (settings.useDenoiser)
                 {
-                    progressReporter?.Report((0.9f, "ƒfƒmƒCƒU[“K—p’†..."));
-                    progressReporter?.Report((1f, "ƒfƒmƒCƒU[“K—pŠ®—¹"));
+                    progressReporter?.Report((0.9f, "ï¿½fï¿½mï¿½Cï¿½Uï¿½[ï¿½Kï¿½pï¿½ï¿½..."));
+                    progressReporter?.Report((1f, "ï¿½fï¿½mï¿½Cï¿½Uï¿½[ï¿½Kï¿½pï¿½ï¿½ï¿½ï¿½"));
                 }
 
                 return lightmapTexture;
             }
             catch (OperationCanceledException) 
             { 
-                progressReporter?.Report((0f, "ˆ—ƒLƒƒƒ“ƒZƒ‹")); 
-                Debug.Log("BakingCore: ˆ—ƒLƒƒƒ“ƒZƒ‹"); 
+                progressReporter?.Report((0f, "ï¿½ï¿½ï¿½ï¿½ï¿½Lï¿½ï¿½ï¿½ï¿½ï¿½Zï¿½ï¿½")); 
+                Debug.Log("BakingCore: ï¿½ï¿½ï¿½ï¿½ï¿½Lï¿½ï¿½ï¿½ï¿½ï¿½Zï¿½ï¿½"); 
                 return null; 
             }
             catch (Exception ex) 
             { 
-                progressReporter?.Report((0f, $"ƒGƒ‰[: {ex.GetType().Name}")); 
+                progressReporter?.Report((0f, $"ï¿½Gï¿½ï¿½ï¿½[: {ex.GetType().Name}")); 
                 Debug.LogException(ex); 
                 return null; 
             }
@@ -746,7 +756,7 @@ namespace RTCK.NeuraBake.Runtime
             int unoccludedRayCountAtomic = 0;
             float maxAoDistance = 2.0f;
 
-            // AOƒTƒ“ƒvƒ‹•ûŒü‚ğ–‘O¶¬i’PˆÊ”¼‹…ã‚É•ª•zj
+            // AOï¿½Tï¿½ï¿½ï¿½vï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Oï¿½ï¿½ï¿½ï¿½ï¿½iï¿½Pï¿½Ê”ï¿½ï¿½ï¿½ï¿½ï¿½É•ï¿½ï¿½zï¿½j
             Vector3[] sampleDirections = GenerateHemisphereDirections(normal, sampleCount);
 
             Parallel.For(0, sampleCount, i =>
@@ -772,28 +782,28 @@ namespace RTCK.NeuraBake.Runtime
             return (finalOcclusion, finalBentNormalY, unoccludedRayCountAtomic);
         }
 
-        // ƒƒCƒ“ƒXƒŒƒbƒh‚Åg—p‚·‚éA”¼‹…ã‚É‚Ù‚Ú‹Ï“™‚É•ª•z‚·‚éƒxƒNƒgƒ‹‚ğ¶¬‚·‚éƒƒ\ƒbƒh
+        // ï¿½ï¿½ï¿½Cï¿½ï¿½ï¿½Xï¿½ï¿½ï¿½bï¿½hï¿½Ågï¿½pï¿½ï¿½ï¿½ï¿½Aï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É‚Ù‚Ú‹Ï“ï¿½ï¿½É•ï¿½ï¿½zï¿½ï¿½ï¿½ï¿½xï¿½Nï¿½gï¿½ï¿½ï¿½ğ¶ï¿½ï¿½ï¿½ï¿½éƒï¿½\ï¿½bï¿½h
         private Vector3[] GenerateHemisphereDirections(Vector3 normal, int count)
         {
             Vector3[] directions = new Vector3[count];
             
-            // ŠÈ’P‚ÈƒtƒBƒ{ƒiƒbƒ`‹…–Ê•ª•z‚ğg—p
+            // ï¿½È’Pï¿½Èƒtï¿½Bï¿½{ï¿½iï¿½bï¿½`ï¿½ï¿½ï¿½Ê•ï¿½ï¿½zï¿½ï¿½ï¿½gï¿½p
             float goldenRatio = (1f + Mathf.Sqrt(5f)) / 2f;
             float angleIncrement = Mathf.PI * 2f * goldenRatio;
             
             for (int i = 0; i < count; i++)
             {
                 float t = (float)i / count;
-                float inclination = Mathf.Acos(1f - t); // ”¼‹…•ª•z‚Ì‚½‚ß1‚©‚çƒXƒ^[ƒg
+                float inclination = Mathf.Acos(1f - t); // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½zï¿½Ì‚ï¿½ï¿½ï¿½1ï¿½ï¿½ï¿½ï¿½Xï¿½^ï¿½[ï¿½g
                 float azimuth = angleIncrement * i;
                 
-                // ‹…–ÊÀ•W‚©‚ç’¼ŒğÀ•W‚Ö•ÏŠ·
+                // ï¿½ï¿½ï¿½Êï¿½ï¿½Wï¿½ï¿½ï¿½ç’¼ï¿½ï¿½ï¿½ï¿½ï¿½Wï¿½Ö•ÏŠï¿½
                 float x = Mathf.Sin(inclination) * Mathf.Cos(azimuth);
                 float y = Mathf.Sin(inclination) * Mathf.Sin(azimuth);
                 float z = Mathf.Cos(inclination);
-                Vector3 dir = new Vector3(x, z, y); // Unity‚ÌÀ•WŒn‚É‡‚í‚¹‚é
+                Vector3 dir = new Vector3(x, z, y); // Unityï¿½Ìï¿½ï¿½Wï¿½nï¿½Éï¿½ï¿½í‚¹ï¿½ï¿½
                 
-                // normal‚ğã•ûŒü‚Æ‚µ‚Ä’²®
+                // normalï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ‚ï¿½ï¿½Ä’ï¿½ï¿½ï¿½
                 Vector3 up = Vector3.up;
                 if (Mathf.Abs(Vector3.Dot(normal, up)) > 0.99f)
                     up = Vector3.forward;
@@ -956,7 +966,7 @@ namespace RTCK.NeuraBake.Runtime
             return skyColor * albedo * settings.skyIntensity * ambientInfo.ambientIntensity;
         }
         
-        // PBRƒ‰ƒCƒeƒBƒ“ƒOŒvZ
+        // PBRï¿½ï¿½ï¿½Cï¿½eï¿½Bï¿½ï¿½ï¿½Oï¿½vï¿½Z
         private Color CalculatePBRDirectLight(Vector3 L, Vector3 V, Vector3 N, Color lightColor, Color albedo, float metallic, float roughness)
         {
             L = L.normalized; 
@@ -969,19 +979,19 @@ namespace RTCK.NeuraBake.Runtime
             float NdotV = Mathf.Max(0f, Vector3.Dot(N, V));
             float alpha = roughness * roughness;
             
-            // F0‚ÌŒvZi‹à‘®“x‚ÉŠî‚Ã‚­j
+            // F0ï¿½ÌŒvï¿½Zï¿½iï¿½ï¿½ï¿½ï¿½ï¿½xï¿½ÉŠï¿½Ã‚ï¿½ï¿½j
             Color F0 = Color.Lerp(new Color(0.04f, 0.04f, 0.04f), albedo, metallic);
             
-            // ŠeBRDFƒRƒ“ƒ|[ƒlƒ“ƒg‚ÌŒvZ
+            // ï¿½eBRDFï¿½Rï¿½ï¿½ï¿½|ï¿½[ï¿½lï¿½ï¿½ï¿½gï¿½ÌŒvï¿½Z
             float D = GGX_Distribution(N, H, alpha);
             Color F = Fresnel_Schlick(Mathf.Max(0f, Vector3.Dot(H, V)), F0);
             float Vis = Smith_Visibility_JointGGX(N, V, L, alpha);
             
-            // ƒGƒlƒ‹ƒM[•Û‘¶‚ğl—¶‚µ‚½ŠgU”½Ë
+            // ï¿½Gï¿½lï¿½ï¿½ï¿½Mï¿½[ï¿½Û‘ï¿½ï¿½ï¿½ï¿½lï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½gï¿½Uï¿½ï¿½ï¿½ï¿½
             Color kd = Color.Lerp(Color.white - F, Color.black, metallic);
             Color diffuse = kd * albedo / Mathf.PI;
             
-            // ‹¾–Ê”½Ë
+            // ï¿½ï¿½ï¿½Ê”ï¿½ï¿½ï¿½
             Color specular = D * F * Vis;
             
             return (diffuse + specular) * lightColor * NdotL;
@@ -1041,7 +1051,7 @@ namespace RTCK.NeuraBake.Runtime
             
             float[] sampleResults = new float[shadowSamples];
             
-            // –‘OŒvZÏ‚İ‚Ì•ûŒüƒf[ƒ^‚ğg—p
+            // ï¿½ï¿½ï¿½Oï¿½vï¿½Zï¿½Ï‚İ‚Ì•ï¿½ï¿½ï¿½ï¿½fï¿½[ï¿½^ï¿½ï¿½ï¿½gï¿½p
             Vector3[] randomDirections = jitterDirections[shadowSamples];
             
             Parallel.For(0, shadowSamples, i =>
@@ -1049,7 +1059,7 @@ namespace RTCK.NeuraBake.Runtime
                 Vector3 jld = lightDir;
                 if (shadowSamples > 1)
                 {
-                    // –‘O¶¬‚³‚ê‚½—”’l‚ğg—p
+                    // ï¿½ï¿½ï¿½Oï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ê‚½ï¿½ï¿½ï¿½ï¿½ï¿½lï¿½ï¿½ï¿½gï¿½p
                     jld = (lightDir + randomDirections[i]).normalized;
                 }
                 Ray sr = new Ray(worldPos + worldNormal * 0.001f, -jld);
@@ -1062,30 +1072,30 @@ namespace RTCK.NeuraBake.Runtime
             return shadowAccumulator / shadowSamples;
         }
 
-        // ‰ü—Ç‚³‚ê‚½ƒGƒbƒWƒpƒfƒBƒ“ƒOˆ— - UV“‡‚ğl—¶‚µ‚Ä‹«ŠEü‚Ì”’Ÿø‚İ‚ğ–h~
+        // ï¿½ï¿½ï¿½Ç‚ï¿½ï¿½ê‚½ï¿½Gï¿½bï¿½Wï¿½pï¿½fï¿½Bï¿½ï¿½ï¿½Oï¿½ï¿½ï¿½ï¿½ - UVï¿½ï¿½ï¿½ï¿½ï¿½lï¿½ï¿½ï¿½ï¿½ï¿½Ä‹ï¿½ï¿½Eï¿½ï¿½ï¿½Ì”ï¿½ï¿½ï¿½ï¿½İ‚ï¿½hï¿½~
         private static void DilationEdgePadding(Color[] pixels, int width, int height, int iterations = 2)
         {
             if (pixels == null || pixels.Length != width * height) return;
 
-            // Œ³‚ÌƒsƒNƒZƒ‹‚ğ•Û‘¶iÅI“I‚Èˆ—‚ÅŒ³‚Ì—LŒø‚ÈƒsƒNƒZƒ‹‚ğ•Û‚·‚é‚½‚ßj
+            // ï¿½ï¿½ï¿½Ìƒsï¿½Nï¿½Zï¿½ï¿½ï¿½ï¿½Û‘ï¿½ï¿½iï¿½ÅIï¿½Iï¿½Èï¿½ï¿½ï¿½ï¿½ÅŒï¿½ï¿½Ì—Lï¿½ï¿½ï¿½Èƒsï¿½Nï¿½Zï¿½ï¿½ï¿½ï¿½Ûï¿½ï¿½ï¿½ï¿½é‚½ï¿½ßj
             Color[] originalPixels = new Color[pixels.Length];
             Array.Copy(pixels, originalPixels, pixels.Length);
 
-            // ƒsƒNƒZƒ‹‚Ìˆ—ó‘Ô‚ğ’ÇÕ‚·‚éƒ}ƒXƒN (0=–¢ˆ—, 1=—LŒø‚ÈƒsƒNƒZƒ‹, 2=ƒpƒfƒBƒ“ƒO‚³‚ê‚½ƒsƒNƒZƒ‹)
+            // ï¿½sï¿½Nï¿½Zï¿½ï¿½ï¿½Ìï¿½ï¿½ï¿½ï¿½ï¿½Ô‚ï¿½ÇÕ‚ï¿½ï¿½ï¿½}ï¿½Xï¿½N (0=ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½, 1=ï¿½Lï¿½ï¿½ï¿½Èƒsï¿½Nï¿½Zï¿½ï¿½, 2=ï¿½pï¿½fï¿½Bï¿½ï¿½ï¿½Oï¿½ï¿½ï¿½ê‚½ï¿½sï¿½Nï¿½Zï¿½ï¿½)
             byte[] pixelState = new byte[pixels.Length];
             for (int i = 0; i < pixels.Length; i++)
             {
                 if (pixels[i].a > 0.001f) 
                 {
-                    pixelState[i] = 1; // Šù‚É—LŒø‚ÈƒsƒNƒZƒ‹
+                    pixelState[i] = 1; // ï¿½ï¿½ï¿½É—Lï¿½ï¿½ï¿½Èƒsï¿½Nï¿½Zï¿½ï¿½
                 }
             }
 
-            // UV“‡‚ÌŒó•â—Ìˆæ‚ğ¯•Êi—×Ú‚·‚é—LŒø‚ÈƒsƒNƒZƒ‹‚Í“¯‚¶“‡‚É‘®‚·‚éj
+            // UVï¿½ï¿½ï¿½ÌŒï¿½ï¿½Ìˆï¿½ï¿½ï¿½ï¿½ï¿½Êiï¿½×Ú‚ï¿½ï¿½ï¿½Lï¿½ï¿½ï¿½Èƒsï¿½Nï¿½Zï¿½ï¿½ï¿½Í“ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½É‘ï¿½ï¿½ï¿½ï¿½ï¿½j
             int[] islandIds = new int[pixels.Length];
             int currentIslandId = 0;
 
-            // Še—LŒø‚ÈƒsƒNƒZƒ‹‚©‚çn‚ß‚Ä˜AŒ‹¬•ª‚ğ¯•Êiƒtƒ‰ƒbƒhƒtƒBƒ‹–@j
+            // ï¿½eï¿½Lï¿½ï¿½ï¿½Èƒsï¿½Nï¿½Zï¿½ï¿½ï¿½ï¿½ï¿½ï¿½nï¿½ß‚Ä˜Aï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Êiï¿½tï¿½ï¿½ï¿½bï¿½hï¿½tï¿½Bï¿½ï¿½ï¿½@ï¿½j
             for (int i = 0; i < pixels.Length; i++)
             {
                 if (pixelState[i] == 1 && islandIds[i] == 0)
@@ -1101,13 +1111,13 @@ namespace RTCK.NeuraBake.Runtime
                         int x = pixelIdx % width;
                         int y = pixelIdx / width;
 
-                        // 4•ûŒü‚Ü‚½‚Í8•ûŒü‚Ì—×ÚƒsƒNƒZƒ‹‚ğƒ`ƒFƒbƒN
+                        // 4ï¿½ï¿½ï¿½ï¿½ï¿½Ü‚ï¿½ï¿½ï¿½8ï¿½ï¿½ï¿½ï¿½ï¿½Ì—×Úƒsï¿½Nï¿½Zï¿½ï¿½ï¿½ï¿½ï¿½`ï¿½Fï¿½bï¿½N
                         for (int dy = -1; dy <= 1; dy++)
                         {
                             for (int dx = -1; dx <= 1; dx++)
                             {
-                                // 4•ûŒü‚Ì‚İ‚ğg‚¤ê‡‚Í‚±‚Ìƒ`ƒFƒbƒN‚ğ“ü‚ê‚é
-                                // if (dx != 0 && dy != 0) continue; // Î‚ß•ûŒü‚ğƒXƒLƒbƒv
+                                // 4ï¿½ï¿½ï¿½ï¿½ï¿½Ì‚İ‚ï¿½ï¿½gï¿½ï¿½ï¿½ê‡ï¿½Í‚ï¿½ï¿½Ìƒ`ï¿½Fï¿½bï¿½Nï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+                                // if (dx != 0 && dy != 0) continue; // ï¿½Î‚ß•ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Xï¿½Lï¿½bï¿½v
 
                                 int nx = x + dx;
                                 int ny = y + dy;
@@ -1126,7 +1136,7 @@ namespace RTCK.NeuraBake.Runtime
                 }
             }
 
-            // •¡”‰ñ‚ÌŠg’£ˆ—
+            // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÌŠgï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             for (int iter = 0; iter < iterations; iter++)
             {
                 Color[] tempPixels = new Color[pixels.Length];
@@ -1140,41 +1150,41 @@ namespace RTCK.NeuraBake.Runtime
                     {
                         int currentIdx = y * width + x;
                         
-                        // –¢ˆ—‚ÌƒsƒNƒZƒ‹‚Ì‚İƒpƒfƒBƒ“ƒO‘ÎÛ‚Æ‚·‚é
+                        // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ìƒsï¿½Nï¿½Zï¿½ï¿½ï¿½Ì‚İƒpï¿½fï¿½Bï¿½ï¿½ï¿½Oï¿½ÎÛ‚Æ‚ï¿½ï¿½ï¿½
                         if (pixelState[currentIdx] != 0) continue;
                         
-                        // ŠeUV“‡‚²‚Æ‚ÉF‚Ì’~Ï‚ğƒŠƒZƒbƒg
+                        // ï¿½eUVï¿½ï¿½ï¿½ï¿½ï¿½Æ‚ÉFï¿½Ì’~ï¿½Ï‚ï¿½ï¿½ï¿½ï¿½Zï¿½bï¿½g
                         Dictionary<int, ColorAccumulator> islandContributions = new Dictionary<int, ColorAccumulator>();
                         
-                        // üˆÍ8ƒsƒNƒZƒ‹‚©‚ç‚ÌŠñ—^‚ğ’~Ï
+                        // ï¿½ï¿½ï¿½ï¿½8ï¿½sï¿½Nï¿½Zï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÌŠï¿½^ï¿½ï¿½~ï¿½ï¿½
                         for (int dy = -1; dy <= 1; dy++)
                         {
                             for (int dx = -1; dx <= 1; dx++)
                             {
-                                if (dx == 0 && dy == 0) continue; // ©•ª©g‚ÍƒXƒLƒbƒv
+                                if (dx == 0 && dy == 0) continue; // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½gï¿½ÍƒXï¿½Lï¿½bï¿½v
                                 
                                 int nx = x + dx;
                                 int ny = y + dy;
                                 if (nx >= 0 && nx < width && ny >= 0 && ny < height)
                                 {
                                     int neighborIdx = ny * width + nx;
-                                    // —LŒø‚ÈF‚ğ‚ÂƒsƒNƒZƒ‹‚Ì‚İl—¶
+                                    // ï¿½Lï¿½ï¿½ï¿½ÈFï¿½ï¿½ï¿½ï¿½ï¿½Âƒsï¿½Nï¿½Zï¿½ï¿½ï¿½Ì‚İlï¿½ï¿½
                                     if (pixelState[neighborIdx] > 0)
                                     {
                                         int islandId = islandIds[neighborIdx];
-                                        if (islandId > 0) // —LŒø‚ÈUV“‡‚É‘®‚µ‚Ä‚¢‚é
+                                        if (islandId > 0) // ï¿½Lï¿½ï¿½ï¿½ï¿½UVï¿½ï¿½ï¿½É‘ï¿½ï¿½ï¿½ï¿½Ä‚ï¿½ï¿½ï¿½
                                         {
-                                            // ‚±‚Ì“‡‚©‚ç‚ÌŠñ—^‚ğ‚Ü‚¾’ÇÕ‚µ‚Ä‚¢‚È‚¯‚ê‚Î‰Šú‰»
+                                            // ï¿½ï¿½ï¿½Ì“ï¿½ï¿½ï¿½ï¿½ï¿½ÌŠï¿½^ï¿½ï¿½ï¿½Ü‚ï¿½ï¿½ÇÕ‚ï¿½ï¿½Ä‚ï¿½ï¿½È‚ï¿½ï¿½ï¿½Îï¿½ï¿½ï¿½ï¿½ï¿½
                                             if (!islandContributions.TryGetValue(islandId, out ColorAccumulator accumulator))
                                             {
                                                 accumulator = new ColorAccumulator();
                                                 islandContributions[islandId] = accumulator;
                                             }
                                             
-                                            // ‹——£‚É‰‚¶‚½d‚İ•t‚¯
-                                            float weight = (dx == 0 || dy == 0) ? 1.0f : 0.7071f; // Î‚ß‚Íã2‚Ì‹——£‚È‚Ì‚Åd‚İ‚ğŒ¸‚ç‚·
+                                            // ï¿½ï¿½ï¿½ï¿½ï¿½É‰ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½dï¿½İ•tï¿½ï¿½
+                                            float weight = (dx == 0 || dy == 0) ? 1.0f : 0.7071f; // ï¿½Î‚ß‚Íï¿½2ï¿½Ì‹ï¿½ï¿½ï¿½ï¿½È‚Ì‚Ådï¿½İ‚ï¿½ï¿½ï¿½ï¿½ç‚·
                                             
-                                            // F‚Ì’~Ï
+                                            // ï¿½Fï¿½Ì’~ï¿½ï¿½
                                             accumulator.AddColor(pixels[neighborIdx], weight);
                                         }
                                     }
@@ -1182,7 +1192,7 @@ namespace RTCK.NeuraBake.Runtime
                             }
                         }
                         
-                        // Å‚àŠñ—^‚Ì‘å‚«‚¢UV“‡‚ğ‘I‘ğ‚·‚é
+                        // ï¿½Å‚ï¿½ï¿½ï¿½^ï¿½Ì‘å‚«ï¿½ï¿½UVï¿½ï¿½ï¿½ï¿½Iï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                         int bestIslandId = 0;
                         float bestWeight = 0f;
                         Color bestColor = Color.clear;
@@ -1197,37 +1207,37 @@ namespace RTCK.NeuraBake.Runtime
                             }
                         }
                         
-                        // \•ª‚ÈŠñ—^‚ª‚ ‚ê‚ÎA‚±‚ÌƒsƒNƒZƒ‹‚ÉF‚ğŠ„‚è“–‚Ä‚é
+                        // ï¿½\ï¿½ï¿½ï¿½ÈŠï¿½^ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ÎAï¿½ï¿½ï¿½Ìƒsï¿½Nï¿½Zï¿½ï¿½ï¿½ÉFï¿½ï¿½ï¿½ï¿½ï¿½è“–ï¿½Ä‚ï¿½
                         if (bestWeight > 0.01f)
                         {
                             tempPixels[currentIdx] = bestColor;
-                            newPixelState[currentIdx] = 2; // ƒpƒfƒBƒ“ƒO‚³‚ê‚½ƒsƒNƒZƒ‹‚Æ‚µ‚Äƒ}[ƒN
-                            islandIds[currentIdx] = bestIslandId; // ‚±‚Ì“‡‚É‘®‚·‚é‚Æƒ}[ƒN
+                            newPixelState[currentIdx] = 2; // ï¿½pï¿½fï¿½Bï¿½ï¿½ï¿½Oï¿½ï¿½ï¿½ê‚½ï¿½sï¿½Nï¿½Zï¿½ï¿½ï¿½Æ‚ï¿½ï¿½Äƒ}ï¿½[ï¿½N
+                            islandIds[currentIdx] = bestIslandId; // ï¿½ï¿½ï¿½Ì“ï¿½ï¿½É‘ï¿½ï¿½ï¿½ï¿½ï¿½Æƒ}ï¿½[ï¿½N
                         }
                     }
                 }
                 
-                // XV‚ğƒƒCƒ“ƒoƒbƒtƒ@‚É”½‰f
+                // ï¿½Xï¿½Vï¿½ï¿½ï¿½ï¿½ï¿½Cï¿½ï¿½ï¿½oï¿½bï¿½tï¿½@ï¿½É”ï¿½ï¿½f
                 Array.Copy(tempPixels, pixels, pixels.Length);
                 Array.Copy(newPixelState, pixelState, pixelState.Length);
             }
             
-            // Œ³X—LŒø‚¾‚Á‚½ƒsƒNƒZƒ‹‚ÌF‚ğ•Û
+            // ï¿½ï¿½ï¿½Xï¿½Lï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½sï¿½Nï¿½Zï¿½ï¿½ï¿½ÌFï¿½ï¿½Ûï¿½
             for (int i = 0; i < pixels.Length; i++)
             {
-                if (pixelState[i] == 1) // Œ³X—LŒø‚¾‚Á‚½ƒsƒNƒZƒ‹
+                if (pixelState[i] == 1) // ï¿½ï¿½ï¿½Xï¿½Lï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½sï¿½Nï¿½Zï¿½ï¿½
                 {
                     pixels[i] = originalPixels[i];
                 }
-                else if (pixelState[i] == 2) // ƒpƒfƒBƒ“ƒO‚³‚ê‚½ƒsƒNƒZƒ‹
+                else if (pixelState[i] == 2) // ï¿½pï¿½fï¿½Bï¿½ï¿½ï¿½Oï¿½ï¿½ï¿½ê‚½ï¿½sï¿½Nï¿½Zï¿½ï¿½
                 {
-                    // ƒAƒ‹ƒtƒ@’l‚ğ1.0‚Éİ’èi“§–¾‚Å‚È‚¢‚±‚Æ‚ğ•ÛØj
+                    // ï¿½Aï¿½ï¿½ï¿½tï¿½@ï¿½lï¿½ï¿½1.0ï¿½Éİ’ï¿½iï¿½ï¿½ï¿½ï¿½ï¿½Å‚È‚ï¿½ï¿½ï¿½ï¿½Æ‚ï¿½ÛØj
                     pixels[i].a = 1.0f;
                 }
             }
         }
 
-        // F‚Ì’~Ï‚Æ•½‹Ï‰»‚ğs‚¤ƒwƒ‹ƒp[ƒNƒ‰ƒX
+        // ï¿½Fï¿½Ì’~ï¿½Ï‚Æ•ï¿½ï¿½Ï‰ï¿½ï¿½ï¿½ï¿½sï¿½ï¿½ï¿½wï¿½ï¿½ï¿½pï¿½[ï¿½Nï¿½ï¿½ï¿½X
         private class ColorAccumulator
         {
             private float r = 0f, g = 0f, b = 0f, a = 0f;
